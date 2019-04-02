@@ -7,6 +7,7 @@ This code is developed based on [Caffe](https://github.com/BVLC/caffe/).
 * [Prerequisites](#prerequisites)
 * [Train_Model](#train_model)
 * [Extract_DeepFeature](#extract_deepfeature)
+* [Evaluation](#evaluation)
 * [Contact](#contact)
 * [Citation](#citation)
 * [LICENSE](#license)
@@ -16,7 +17,7 @@ This code is developed based on [Caffe](https://github.com/BVLC/caffe/).
 - Apr 02, 2019
   * The code and training prototxt for our [CVPR19](http://bhchen.cn) paper are released.
   * For simplication, we use Hinge_Loss-like adversarial constraint instead of the original adversary network (This will reduce the final performance a little but ease the training. We also provide the "gradients_reverse_layer" for the implementation of the orginal adversary network, you can try it by yourself.).
-  * If you train our Network on **CUB-200**, the expected retrieval performance of DeML(I=3,J=3) will be ~**(R@1=64.7, R@2=75.1, R@4=83.2, R@8=89.4)** at ~10k iterations.
+  * If you train our Network on **CUB-200**, the expected retrieval performance of **DeML(I=3,J=3)** will be ~**(R@1=64.7, R@2=75.1, R@4=83.2, R@8=89.4)** at ~10k iterations.
 
 ### Files
 - Original Caffe library
@@ -52,8 +53,8 @@ This code is developed based on [Caffe](https://github.com/BVLC/caffe/).
 2. Download the training images [CUB]() and move it to $(your_path). The images are preprossed the same as [Lifted Loss](https://github.com/rksltnl/Deep-Metric-Learning-CVPR16/), i.e. with zero paddings.
 3. Download the training_list (~400M), and move it ~/DeML/examples/CUB/ . (Or you can create your own list by randomly selecting 65 classes with 2 samples each class.)
 4. Download googlenetV1 model (used for U512) and 3nets model (used for DeML3-3_512) to folder ~/DeML/examples/CUB/pre-trained-model/
-5. Modify the images path by changing "root_folder" in all *.prototxt into $(your_path).
-6. Then you can train our baseline method U512 and the proposed DeML3-3_512 by running
+5. Modify the images path by changing "root_folder" into $(your_path) in all *.prototxt .
+6. Then you can train our baseline method **U512** and the proposed **DeML(I=3,J=3)** by running
 ```
         cd ~/DeML/examples/CUB/U512
         ./finetune_U512.sh
@@ -63,17 +64,21 @@ and
         cd ~/DeML/examples/CUB/DeML3-3_512
         ./finetune_DeML3-3_512.sh
 ```     
+the trained models are stored in folder "run_U512/" and "run_DeML3-3_512/" respectively.
 ### Extract_DeepFeature
-1. Compile matcaffe by make matcaffe
-2. Specify the correspinding paths in face_example/extractDeepFeature.m
+1. run the following code for **U512** and **DeML(I=3,J=3)** respectively.
+```
+        cd ~/DeML/examples/CUB/U512
+        ./extractfeatures.sh
+```
 
-        addpath('path_to_matCaffe/matlab');
-        model = 'path_to_deploy/face_deploy.prototxt';
-        weights = 'path_to_model/face_model.caffemodel';
-        image = imread('path_to_image/Jennifer_Aniston_0016.jpg');
-
-3. Run extractDeepFeature.m in Matlab
-
+```
+        cd ~/DeML/examples/CUB/DeML3-3_512
+        ./extractfeatures.sh
+```
+the feature files are stored at folder "features/"
+### Evaluation
+1. Run code in folder ~/DeML/evaluation/
 ### Contact 
 - [Binghui Chen](http://bhchen.cn)
 

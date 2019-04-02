@@ -1,0 +1,177 @@
+function evaluate_recall()
+clear all;
+label_num=5924;%cub 5924  cars 8131  ebay 60502 market 13115/19732 flower 4696
+p=importdata('../../caffe/examples/cub/val.txt');%cub ../../caffe/examples/model/cub/val.txt%cars  ../../caffe/examples/model/cars/car_test.txt
+%ebay ../../caffe/examples/model/ebay/ebay_test.txt
+%flower ../../caffe/examples/flower/flower_test.txt
+label=p.data;
+clear p
+curve=[];
+for ind =10500:500:15000
+try
+    features_all=[];
+    for i=1:1
+    fea1=sprintf('~/DeML/examples/CUB/DeML3-3_512/features/model_512_%d.fea',ind)
+    feafile=fopen(fea1,'rb');
+    [dims]=fread(feafile,1,'int');
+    [num]=fread(feafile,1,'int');
+    feature=fread(feafile,dims*num,'float');
+    fclose(feafile);
+     features=reshape(feature,dims,num);
+     clear feature
+     
+     features_all=[features_all;features(:,1:label_num)];%5924,5864==val,train
+    end
+     features=features_all;
+     clear features_all;
+       
+catch
+    error('filename is non existent.\n');
+end
+
+kk = [1 2 4 8];
+             features=features./repmat(sqrt(sum(features.^2)),size(features,1),1);
+             
+%              features = exp(features'*features*50)./repmat(sum(exp(features'*features*50),2),[1,label_num])*features';
+%              features = features';
+%              features=features./repmat(sqrt(sum(features.^2)),size(features,1),1);
+%              size(features)
+features=single(features');
+dims = size(features);
+
+ %D2 = distance_matrix(features);
+
+ m = size(features, 1);
+t = single(ones(m, 1));
+x = single(zeros(m, 1));
+for i = 1:m
+    n = norm(features(i,:));
+    x(i) = n * n;
+end
+% % 
+%    D2 = x * t';
+%    D2 = D2 + t * x';
+%    D2 = D2 - 2*features * features';   % for L2
+D2 =-1*features * features'; % for cosine
+class_ids=label;
+
+ num = dims(1);
+%  D2 = (sqrt(abs(D2)));
+ D2(1:num+1:num*num) = inf;
+% 
+
+knn_class_inds=single(zeros(num,kk(end)));
+tic
+for i = 1 : num
+    this_row = D2(i,:);
+    [~, inds] = sort(this_row, 'ascend');
+    knn_inds = inds(1:kk(end));
+    
+    knn_class_inds(i,:) = class_ids(knn_inds);
+end
+toc
+for K = kk
+    curve=[curve;compute_recall_at_K(K, class_ids, num, knn_class_inds(:,1:K))];
+end
+
+end 
+disp('done');
+% 
+% D2=-1*D2;
+%  D=D2;
+% % D1=D2;
+% 
+% num=size(D2,1);
+%  D(1:num+1:num*num) = inf;
+% 
+%  pos=[];
+%  neg=[];
+%  
+%  for i=1:size(D2,1)
+%      figure(1)
+%      indexp=find(label==label(i));
+%      indexn=setdiff([1:8131],indexp);
+%      pos=[pos;D(indexp,i)];
+%      temp=sort(D(indexn,i));
+%      neg=[neg;temp];
+%      
+%  end
+%  pos=setdiff(pos,[inf]);
+% %  figure(1)
+%  nn=hist(neg,[-1:0.02:1]);
+%  bar(nn/sum(nn))
+%  hold on;
+%  pn=hist(pos,[-1:0.02:1]);
+% 
+%  bar(pn/sum(pn),'facecolor', [1 0 0])
+% 
+
+
+% compute pairwise distance matrix  L2 distance
+% function D = distance_matrix(X)
+% 
+% m = size(X, 1);
+% t = ones(m, 1);
+% x = zeros(m, 1);
+% for i = 1:m
+%     n = norm(X(i,:));
+%     x(i) = n * n;
+% end
+% 
+% D = x * t' + t * x' - 2 * X * X';
+
+% compute recall@K
+function recall = compute_recall_at_K(K, class_ids, num, knn_class_inds)
+num_correct = 0;
+for i = 1 : num
+    this_gt_class_idx = class_ids(i);
+    
+    if sum(ismember(knn_class_inds(i,:), this_gt_class_idx)) > 0
+        num_correct = num_correct + 1;
+    end
+end
+
+recall = num_correct / num;
+fprintf('K: %d, Recall: %.3f\n', K, recall);
+
+
+
+% data=importdata('../../caffe/examples/car/train_car_16_8.txt');
+% file=fopen('../../caffe/examples/car/train_car_16_8_perturbation.txt','w');
+% for i=1:numel(data.data)/128
+%     for k=1:2
+%     for j=1:128
+%         fprintf(file,'%s %d\r\n',data.rowheaders{(i-1)*128+j},data.data((i-1)*128+j));
+%     end
+%     end
+% end
+% fclose(file);
+%%
+% clear all;
+% clc;
+% label_num=5864;%cub 5924  cars 8131  ebay 60502 market 13115/19732 flower 4696
+% p=importdata('../../caffe/examples/cub/train.txt');%cub ../../caffe/examples/model/cub/val.txt%cars  ../../caffe/examples/model/cars/car_test.txt
+% %ebay ../../caffe/examples/model/ebay/ebay_test.txt
+% %flower ../../caffe/examples/flower/flower_test.txt
+% label=p.data;
+% clear p
+% fea1=sprintf('../../caffe/examples/cub/features/modeltrain_512_5000.fea')
+%     feafile=fopen(fea1,'rb');
+%     [dims]=fread(feafile,1,'int');
+%     [num]=fread(feafile,1,'int');
+%     feature=fread(feafile,dims*num,'float');
+%     fclose(feafile);
+%      features=reshape(feature,dims,num);
+%      clear feature
+%      vec=features(:,1:label_num);
+% 
+% % vec=vec./repmat(sqrt(sum(vec.^2)),[2 1]);
+% color=colormap(hsv(numel(unique(label))));
+% for i=1:label_num
+% %     label(i)
+%    plot3(vec(1,i), vec(2,i), vec(3,i), 'color', color(find(label(i)==unique(label)),:),'Marker','.');
+%    hold on;
+% %            
+% %    waitforbuttonpress();
+% end
+%  
