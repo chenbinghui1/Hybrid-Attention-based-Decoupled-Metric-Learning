@@ -1,0 +1,50 @@
+#ifndef CAFFE_PROPOSAL_CROP_LAYER_HPP_
+#define CAFFE_PROPOSAL_CROP_LAYER_HPP_
+
+#include <vector>
+
+#include "caffe/blob.hpp"
+#include "caffe/layer.hpp"
+#include "caffe/proto/caffe.pb.h"
+
+namespace caffe {
+
+
+template<typename Dtype>
+class ProposalCropLayer: public Layer<Dtype> {
+ public:
+    explicit ProposalCropLayer(const LayerParameter& param) :
+            Layer<Dtype>(param) {
+    }
+    virtual void LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+            const vector<Blob<Dtype>*>& top);
+    virtual void Reshape(const vector<Blob<Dtype>*>& bottom,
+            const vector<Blob<Dtype>*>& top);
+
+    virtual inline const char* type() const {
+        return "ProposalCrop";
+    }
+    virtual inline int ExactNumBottomBlobs() const {
+        return 2;
+    }
+    virtual inline int ExactNumTopBlobs() const {
+        return 1;
+    }
+ protected:
+    virtual void Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+            const vector<Blob<Dtype>*>& top);
+
+    virtual void Backward_cpu(const vector<Blob<Dtype>*>& top,
+            const vector<bool>& propagate_down,
+            const vector<Blob<Dtype>*>& bottom);
+            
+    Blob<Dtype> M_;
+    Blob<Dtype> D_;
+    Blob<Dtype> tmp_;
+    Blob<Dtype> tmp_M_;
+
+};
+
+}  // namespace caffe
+
+#endif  //

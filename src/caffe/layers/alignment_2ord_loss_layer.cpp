@@ -1,0 +1,171 @@
+//alignment 2ord loss layer, loss_weight/C*sum(weight_c*||Cov_c^s-Cov_c^t||^2) + loss_weight*alpha*sum(||Cov_c-1||^2),   loss_weight is not alignment_loss_parameter's loss_weight
+#include <algorithm>
+#include <vector>
+#include "stdio.h"
+#include "caffe/filler.hpp"
+#include "caffe/layer.hpp"
+#include "caffe/layers/alignment_2ord_loss_layer.hpp"
+#include "caffe/util/io.hpp"
+#include "caffe/util/math_functions.hpp"
+#include <cmath>
+/**********************/
+/**/
+namespace caffe {
+
+template <typename Dtype>
+void Alignment2ordLossLayer<Dtype>::LayerSetUp(
+  const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  LossLayer<Dtype>::LayerSetUp(bottom, top);
+  CHECK_EQ(bottom[0]->height(), 1);
+  CHECK_EQ(bottom[0]->width(), 1);
+  CHECK_EQ(bottom[0]->channels(), bottom[1]->channels());
+  if (this->blobs_.size() > 0) {
+    LOG(INFO) << "Skipping parameter initialization";
+  } else {
+      this->blobs_.resize(1);
+    // Initialize the weights
+    vector<int> weight_shape(2);
+    weight_shape[0]=this->layer_param_.alignment_2ord_loss_param().num();
+    weight_shape[1]=1;
+    this->blobs_[0].reset(new Blob<Dtype>(weight_shape));
+    // fill the weights
+    shared_ptr<Filler<Dtype> > weight_filler(GetFiller<Dtype>(
+        this->layer_param_.alignment_2ord_loss_param().weight_filler()));
+    weight_filler->Fill(this->blobs_[0].get());
+  }  // parameter initialization
+  this->param_propagate_down_.resize(this->blobs_.size(), true);//should be initialized with constant 1;
+}
+template <typename Dtype>
+void Alignment2ordLossLayer<Dtype>::Reshape(
+    const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+    vector<int> loss_shape(0);  // Loss layers output a scalar; 0 axes.
+    top[0]->Reshape(loss_shape);
+    temp_source_.Reshape(1,1,this->layer_param_.alignment_2ord_loss_param().source_num(),bottom[0]->channels());
+    temp_target_.Reshape(1,1,this->layer_param_.alignment_2ord_loss_param().target_num(),bottom[1]->channels());
+    one_source_.Reshape(1,1,this->layer_param_.alignment_2ord_loss_param().source_num(),this->layer_param_.alignment_2ord_loss_param().source_num());
+    one_target_.Reshape(1,1,this->layer_param_.alignment_2ord_loss_param().target_num(),this->layer_param_.alignment_2ord_loss_param().target_num());
+    temp_.Reshape(1,1,bottom[0]->channels(),bottom[0]->channels());
+    //initialize ones metrix
+    for(int i=0; i<this->layer_param_.alignment_2ord_loss_param().source_num(); i++)
+        for(int j=0; j<this->layer_param_.alignment_2ord_loss_param().source_num(); j++)
+        {
+                if(i==j)
+                        one_source_.mutable_cpu_data()[i*this->layer_param_.alignment_2ord_loss_param().source_num()+j] = Dtype((this->layer_param_.alignment_2ord_loss_param().source_num()-1))/this->layer_param_.alignment_2ord_loss_param().source_num()/this->layer_param_.alignment_2ord_loss_param().source_num();
+                else
+                        one_source_.mutable_cpu_data()[i*this->layer_param_.alignment_2ord_loss_param().source_num()+j] = -1.0/this->layer_param_.alignment_2ord_loss_param().source_num()/this->layer_param_.alignment_2ord_loss_param().source_num();
+        }
+    for(int i=0; i<this->layer_param_.alignment_2ord_loss_param().target_num(); i++)
+        for(int j=0; j<this->layer_param_.alignment_2ord_loss_param().target_num(); j++)
+        {
+                if(i==j)
+                        one_target_.mutable_cpu_data()[i*this->layer_param_.alignment_2ord_loss_param().target_num()+j] = Dtype((this->layer_param_.alignment_2ord_loss_param().target_num()-1))/this->layer_param_.alignment_2ord_loss_param().target_num()/this->layer_param_.alignment_2ord_loss_param().target_num();
+                else
+                        one_target_.mutable_cpu_data()[i*this->layer_param_.alignment_2ord_loss_param().target_num()+j] = -1.0/this->layer_param_.alignment_2ord_loss_param().target_num()/this->layer_param_.alignment_2ord_loss_param().target_num();
+        }
+}
+
+template <typename Dtype>
+void Alignment2ordLossLayer<Dtype>::Forward_cpu(
+    const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+    const Dtype* s_data = bottom[0]->cpu_data();//source data
+    const Dtype* t_data = bottom[1]->cpu_data();//target data
+    const Dtype* s_label = bottom[2]->cpu_data();
+    const Dtype* t_label = bottom[3]->cpu_data();
+    Dtype* weight = this->blobs_[0]->mutable_cpu_data();
+    
+    int s_num = bottom[0]->num();//source batch number
+    int t_num = bottom[1]->num();//target batch number
+    int channels = bottom[0]->channels();
+    Dtype alpha = this->layer_param_.alignment_2ord_loss_param().alpha();
+    Dtype loss_weight = this->layer_param_.alignment_2ord_loss_param().loss_weight();//copy loss_weight value
+    int source_num = this->layer_param_.alignment_2ord_loss_param().source_num();//source number of each class
+    int target_num = this->layer_param_.alignment_2ord_loss_param().target_num();//target number of each class
+    
+    Dtype loss = 0; 
+    //compute loss
+    vector<int> flag;//store label
+    vector<Dtype> weight_temp;//store weight gradients
+    caffe_set(bottom[0]->count(), Dtype(0), bottom[0]->mutable_cpu_diff());
+    caffe_set(bottom[1]->count(), Dtype(0), bottom[1]->mutable_cpu_diff());
+    for(int i = 0; i < s_num; i++)
+    {
+        vector<int>::iterator result = find(flag.begin(), flag.end(), static_cast<int>(s_label[i]));
+        if(result != flag.end())
+        {
+                continue;
+        }
+        else
+        {
+                flag.push_back(static_cast<int>(s_label[i]));// new class
+                caffe_set(channels, Dtype(0), temp_.mutable_cpu_data());
+                vector<int> s_index, t_index;
+                //find all data belonging to this new class
+                for(int j = 0; j < s_num; j++)
+                {
+                        if(static_cast<int>(s_label[j])==static_cast<int>(s_label[i]))
+                                s_index.push_back(j);
+                }
+                for(int j = 0; j < t_num; j++)
+                {
+                        if(static_cast<int>(t_label[j])==static_cast<int>(s_label[i]))
+                                t_index.push_back(j);
+                }
+                //check if the data are adjacent
+                if(s_index[s_index.size()-1]-s_index[0]==s_index.size()-1 && t_index[t_index.size()-1]-t_index[0]==t_index.size()-1){
+                        //compute domain Cov w.r.t. class
+                        //source
+                        caffe_cpu_gemm(CblasNoTrans, CblasNoTrans, source_num, channels, source_num, Dtype(1), one_source_.mutable_cpu_data(), s_data + s_index[0] * channels, Dtype(0), temp_source_.mutable_cpu_data());
+                        caffe_cpu_gemm(CblasTrans, CblasNoTrans, channels, channels, source_num, Dtype(1), s_data + s_index[0] * channels, temp_source_.mutable_cpu_data(), Dtype(0), temp_.mutable_cpu_data());
+                        //source - target
+                        caffe_cpu_gemm(CblasNoTrans, CblasNoTrans, target_num, channels, target_num, Dtype(1), one_target_.mutable_cpu_data(), t_data + t_index[0] * channels, Dtype(0), temp_target_.mutable_cpu_data());
+                        caffe_cpu_gemm(CblasTrans, CblasNoTrans, channels, channels, target_num, Dtype(-1), t_data + t_index[0] * channels, temp_target_.mutable_cpu_data(), Dtype(1), temp_.mutable_cpu_data());
+                        Dtype loss_temp = caffe_cpu_dot(temp_.count(), temp_.cpu_data(), temp_.cpu_data());
+                        loss = loss + weight[static_cast<int>(s_label[i])] * loss_temp;
+                        //compute bottom gradients
+                        caffe_cpu_gemm(CblasNoTrans, CblasNoTrans, source_num, channels, channels, Dtype(4.0*weight[static_cast<int>(s_label[i])]), temp_source_.mutable_cpu_data(), temp_.mutable_cpu_data(), Dtype(1), bottom[0]->mutable_cpu_diff() + s_index[0] * channels);
+                        caffe_cpu_gemm(CblasNoTrans, CblasNoTrans, target_num, channels, channels, Dtype(-4.0*weight[static_cast<int>(s_label[i])]), temp_target_.mutable_cpu_data(), temp_.mutable_cpu_data(), Dtype(1), bottom[1]->mutable_cpu_diff() + t_index[0] * channels);
+                        
+                        //store weight gradients
+                        weight_temp.push_back(loss_weight * loss_temp);
+                }
+        }
+    }
+    top[0]->mutable_cpu_data()[0] = loss/flag.size();
+    //compute weighted param constraint loss
+    for(int i = 0; i < flag.size(); i++)
+    {
+        top[0]->mutable_cpu_data()[0] = top[0]->mutable_cpu_data()[0] + alpha * (weight[flag[i]]-Dtype(1)) * (weight[flag[i]]-Dtype(1));
+    }
+    //rescale bottom gradients
+    caffe_cpu_scale(bottom[0]->count(), Dtype(1.0/flag.size()), bottom[0]->cpu_diff(), bottom[0]->mutable_cpu_diff());
+    caffe_cpu_scale(bottom[1]->count(), Dtype(1.0/flag.size()), bottom[1]->cpu_diff(), bottom[1]->mutable_cpu_diff());
+    //compute final weight gradients
+    for(int i = 0; i < flag.size(); i++)
+    {
+         this->blobs_[0]->mutable_cpu_diff()[flag[i]] = this->blobs_[0]->mutable_cpu_diff()[flag[i]] + weight_temp[i]/flag.size() + Dtype(2)*alpha*loss_weight*(weight[flag[i]]-Dtype(1));
+    }
+}
+
+     
+
+template <typename Dtype>
+void Alignment2ordLossLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+	const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) 
+{
+    //rescale bottom gradients
+    caffe_cpu_scale(bottom[0]->count(), top[0]->cpu_diff()[0], bottom[0]->cpu_diff(), bottom[0]->mutable_cpu_diff());
+    caffe_cpu_scale(bottom[1]->count(), top[0]->cpu_diff()[0], bottom[1]->cpu_diff(), bottom[1]->mutable_cpu_diff());
+}
+
+
+
+
+#ifdef CPU_ONLY
+STUB_GPU(Alignment2ordLossLayer);
+#endif
+
+INSTANTIATE_CLASS(Alignment2ordLossLayer);
+REGISTER_LAYER_CLASS(Alignment2ordLoss);
+
+}  // namespace caffe

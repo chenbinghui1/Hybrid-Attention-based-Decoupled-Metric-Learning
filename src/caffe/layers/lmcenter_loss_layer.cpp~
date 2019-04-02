@@ -1,0 +1,241 @@
+/*
+#include <algorithm>
+#include <vector>
+
+#include "caffe/layer.hpp"
+#include "caffe/loss_layers.hpp"
+#include "caffe/util/io.hpp"
+#include "caffe/util/math_functions.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void LMCenterLossLayer<Dtype>::LayerSetUp(
+  const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  LossLayer<Dtype>::LayerSetUp(bottom, top);
+  CHECK_EQ(bottom[0]->height(), 1);
+  CHECK_EQ(bottom[0]->width(), 1);
+  CHECK_EQ(bottom[1]->channels(), 1);
+  CHECK_EQ(bottom[1]->height(), 1);
+  CHECK_EQ(bottom[1]->width(), 1);
+  diff_.Reshape(bottom[0]->num(), bottom[0]->channels(), 1, 1);
+  center_.Reshape(this->layer_param_.lmcenter_loss_param().num_output(), bottom[0]->channels(), 1, 1);
+  for (int i=0; i<this->layer_param_.lmcenter_loss_param().num_output()*bottom[0]->channels(); i++) {
+      center_.mutable_cpu_data()[i] = Dtype(0);
+  }
+  deta_.Reshape(this->layer_param_.lmcenter_loss_param().num_output(), bottom[0]->channels(), 1, 1);
+  m_.Reshape(this->layer_param_.lmcenter_loss_param().num_output(), 1, 1, 1);
+  flag.Reshape(this->layer_param_.lmcenter_loss_param().num_output(), 1, 1, 1);
+  caffe_set(flag.count(), 0, flag.mutable_cpu_data());
+}
+
+template <typename Dtype>
+void LMCenterLossLayer<Dtype>::Forward_cpu(
+    const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+  int num = bottom[0]->num();
+  int channels = bottom[0]->channels();
+  Dtype loss(0.0);
+
+  Dtype* diff = diff_.mutable_cpu_data();
+  Dtype* center = center_.mutable_cpu_data();
+  const Dtype* data = bottom[0]->cpu_data();
+  const Dtype* label = bottom[1]->cpu_data();
+
+  for (int i=0; i<num; i++) {
+      if (flag.mutable_cpu_data()[static_cast<int>(label[i])]==0) {
+         caffe_copy(channels, data + i * channels, center + static_cast<int>(label[i]) * channels);
+         flag.mutable_cpu_data()[static_cast<int>(label[i])] = 1;
+      }
+  //compute diff = xi - ci
+      caffe_sub(channels, data + i * channels, center + static_cast<int>(label[i]) * channels, diff + i * channels);
+  //compute and update loss
+      loss += caffe_cpu_dot(channels, diff + i * channels, diff + i * channels);
+  }
+  loss = loss / static_cast<Dtype>(bottom[0]->num()) / Dtype(2);
+  top[0]->mutable_cpu_data()[0] = loss;
+
+}
+
+template <typename Dtype>
+void LMCenterLossLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) {
+ 
+  const Dtype* label = bottom[1]->cpu_data();
+  Dtype* center = center_.mutable_cpu_data();
+  int channels = bottom[0]->channels();
+  int num = bottom[0]->num();
+//x norm
+ Blob<Dtype> x_norm_;
+ x_norm_.Reshape(num, 1, 1, 1);
+ Dtype* x_norm = x_norm_.mutable_cpu_data();
+ const Dtype* bottom_data = bottom[0]->cpu_data();
+ for (int i = 0; i < num; i++){
+   x_norm[i] = caffe_cpu_dot<Dtype>(channels, bottom_data + i * channels, bottom_data + i * channels);
+   x_norm[i] = std::sqrt(x_norm[i]);
+ }
+ //center norm for each bottom input: num
+ Blob<Dtype> center_norm_;
+ center_norm_.Reshape(num,1,1,1);
+ Dtype* center_norm = center_norm_.mutable_cpu_data();
+ for (int i = 0; i < num; i++) {
+   center_norm[i] = caffe_cpu_dot<Dtype>(channels, center + static_cast<int>(label[i]) * channels, center + static_cast<int>(label[i]) * channels);
+   center_norm[i] = std::sqrt(center_norm[i]);
+ }
+//compute bottom[0] diff
+ for(int i = 0; i < num; i++){
+  Dtype inner_pro = caffe_cpu_dot<Dtype>(channels, bottom_data + i * channels, center + static_cast<int>(label[i]) * channels);
+  int k = inner_pro > 0 ? 0:1;
+  
+  caffe_cpu_axpby(channels, top[0]->cpu_diff()[0]/num * Dtype(1 + (pow(-1,k) + 2*k) * center_norm[i] / x_norm[i] + 2*pow(-1,k)*inner_pro*inner_pro/(pow(x_norm[i],3)*center_norm[i])), bottom[0]->cpu_data() + i * channels, Dtype(0), bottom[0]->mutable_cpu_diff() + i * channels);
+  
+  caffe_axpy(channels, top[0]->cpu_diff()[0]/num *4 * Dtype(pow(-1,k+1)) * inner_pro / (x_norm[i] * center_norm[i]), center + static_cast<int>(label[i]) * channels, bottom[0]->mutable_cpu_diff() + i * channels);
+}
+
+  //update center
+  float alpha = this->layer_param_.center_loss_param().alpha();
+  caffe_set(deta_.count(), Dtype(0), deta_.mutable_cpu_data());
+  caffe_set(m_.count(), Dtype(0), m_.mutable_cpu_data());
+  Dtype* deta = deta_.mutable_cpu_data();
+  Dtype* m = m_.mutable_cpu_data();
+  for (int i=0; i < num; i++) {
+      caffe_cpu_axpby(channels, Dtype(-1), diff_.cpu_data() + i * channels, Dtype(1), deta + static_cast<int>(label[i]) * channels);
+      m[static_cast<int>(label[i])] += 1;
+  }
+  for (int i = 0; i < this->layer_param_.center_loss_param().num_output(); i++) {
+      if (m[i]>0)
+      caffe_scal(channels, Dtype(1)/(m[i] + 1), deta + i * channels);
+  }
+  caffe_cpu_axpby(center_.count(), Dtype(-1) * alpha, deta, Dtype(1), center);
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(LMCenterLossLayer);
+#endif
+
+INSTANTIATE_CLASS(LMCenterLossLayer);
+REGISTER_LAYER_CLASS(LMCenterLoss);
+
+}  // namespace caffe
+*/
+
+//  等長度centerloss
+#include <vector>
+
+#include "caffe/filler.hpp"
+#include "caffe/layers/lmcenter_loss_layer.hpp"
+#include "caffe/util/math_functions.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void LMCenterLossLayer<Dtype>::LayerSetUp(
+  const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  LossLayer<Dtype>::LayerSetUp(bottom, top);
+  CHECK_EQ(bottom[0]->height(), 1);
+  CHECK_EQ(bottom[0]->width(), 1);
+  CHECK_EQ(bottom[1]->channels(), 1);
+  CHECK_EQ(bottom[1]->height(), 1);
+  CHECK_EQ(bottom[1]->width(), 1);
+  diff_.Reshape(bottom[0]->num(), bottom[0]->channels(), 1, 1);
+  center_.Reshape(this->layer_param_.lmcenter_loss_param().num_output(), bottom[0]->channels(), 1, 1);
+  for (int i=0; i<this->layer_param_.lmcenter_loss_param().num_output()*bottom[0]->channels(); i++) {
+      center_.mutable_cpu_data()[i] = Dtype(0);
+  }
+  deta_.Reshape(this->layer_param_.lmcenter_loss_param().num_output(), bottom[0]->channels(), 1, 1);
+  m_.Reshape(this->layer_param_.lmcenter_loss_param().num_output(), 1, 1, 1);
+  flag.Reshape(this->layer_param_.lmcenter_loss_param().num_output(), 1, 1, 1);
+  caffe_set(flag.count(), 0, flag.mutable_cpu_data());
+  x_norm_.Reshape(bottom[0]->num(),1,1,1);
+  diff_center_.Reshape(bottom[0]->num(), bottom[0]->channels(), 1, 1);
+  center_norm_.Reshape(bottom[0]->num(),1,1,1);
+  memory_.Reshape(bottom[0]->channels(),bottom[0]->channels(),1,1);
+  memory1_.Reshape(bottom[0]->num(),bottom[0]->channels(),1,1);
+ ///////////////////////
+//  caffe_set(center_.count(),Dtype(0.02),center_.mutable_cpu_data());
+}
+
+template <typename Dtype>
+void LMCenterLossLayer<Dtype>::Forward_cpu(
+    const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+  int num = bottom[0]->num();
+  int channels = bottom[0]->channels();
+  Dtype loss(0.0);
+  
+  Dtype* diff_center = diff_center_.mutable_cpu_data();
+  Dtype* diff = diff_.mutable_cpu_data();
+  Dtype* center = center_.mutable_cpu_data();
+  const Dtype* data = bottom[0]->cpu_data();
+  const Dtype* label = bottom[1]->cpu_data();
+  Dtype* x_norm = x_norm_.mutable_cpu_data();
+  Dtype* center_norm = center_norm_.mutable_cpu_data();
+  
+  for (int i=0; i<num; i++) {
+      if (flag.mutable_cpu_data()[static_cast<int>(label[i])]==0) {
+         caffe_copy(channels, data + i * channels, center + static_cast<int>(label[i]) * channels);
+         flag.mutable_cpu_data()[static_cast<int>(label[i])] = 1;
+      }
+  // x_norm
+      x_norm[i] = caffe_cpu_dot<Dtype>(channels, data + i * channels, data + i * channels);
+      x_norm[i] = static_cast<Dtype>(std::sqrt(x_norm[i]));
+  //center_norm
+      center_norm[i] = caffe_cpu_dot<Dtype>(channels, center + static_cast<int>(label[i]) * channels, center + static_cast<int>(label[i]) * channels);
+      center_norm[i] = static_cast<Dtype>(std::sqrt(center_norm[i]));
+  //compute diff = xi - ci/|ci|*|xi|
+      caffe_cpu_axpby<Dtype>(channels, x_norm[i]/center_norm[i], center + static_cast<int>(label[i]) * channels, Dtype(0), diff_center + i * channels);
+      caffe_sub<Dtype>(channels, data + i * channels, diff_center + i * channels, diff_center + i * channels);
+  //compute and update loss
+      loss += caffe_cpu_dot<Dtype>(channels, diff_center + i * channels, diff_center + i * channels);
+      //爲後面更新類中信做工作
+      caffe_sub<Dtype>(channels, data + i * channels, center + static_cast<int>(label[i]) * channels, diff + i * channels );
+  }
+  loss = loss / static_cast<Dtype>(bottom[0]->num()) / Dtype(2);
+  top[0]->mutable_cpu_data()[0] = loss;
+}
+
+template <typename Dtype>
+void LMCenterLossLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) {
+
+  int num = bottom[0]->num();
+  int channels = bottom[0]->channels();
+  const Dtype* label = bottom[1]->cpu_data();
+  Dtype* center = center_.mutable_cpu_data();
+  const Dtype* x_norm = x_norm_.cpu_data();
+  const Dtype* center_norm = center_norm_.cpu_data();
+  const Dtype* diff_center = diff_center_.cpu_data();
+  Dtype* memory = memory_.mutable_cpu_data();
+// compute back  xi-center/|center|*|xi| - (xi-center/|center|*|xi|)*(center' * xi)/|center|/|xi|
+  for(int i = 0; i < num; i++){
+       caffe_cpu_gemm<Dtype>(CblasTrans,CblasNoTrans,channels,channels,1,Dtype(1)/(x_norm[i]*center_norm[i]), center + static_cast<int>(label[i]) * channels, bottom[0]->cpu_data() + i * channels, Dtype(0), memory);
+       caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, 1, channels, channels, Dtype(1), diff_center_.cpu_data() + i * channels, memory, Dtype(0), memory1_.mutable_cpu_data() + i * channels);
+       caffe_sub<Dtype>(channels, diff_center + i * channels, memory1_.mutable_cpu_data() + i * channels, bottom[0]->mutable_cpu_diff() + i * channels);
+       caffe_scal<Dtype>(channels, top[0]->cpu_diff()[0]/num, bottom[0]->mutable_cpu_diff() + i * channels);
+}
+
+  //update center
+  float alpha = this->layer_param_.lmcenter_loss_param().alpha();
+  caffe_set(deta_.count(), Dtype(0), deta_.mutable_cpu_data());
+  caffe_set(m_.count(), Dtype(0), m_.mutable_cpu_data());
+  Dtype* deta = deta_.mutable_cpu_data();
+  Dtype* m = m_.mutable_cpu_data();
+  for (int i=0; i < num; i++) {
+      caffe_cpu_axpby(channels, Dtype(-1), diff_.cpu_data() + i * channels, Dtype(1), deta + static_cast<int>(label[i]) * channels);
+      m[static_cast<int>(label[i])] += 1;
+  }
+  for (int i = 0; i < this->layer_param_.lmcenter_loss_param().num_output(); i++) {
+      if (m[i]>0)
+      caffe_scal(channels, Dtype(1)/(m[i] + 1), deta + i * channels);
+  }
+  caffe_cpu_axpby(center_.count(), Dtype(-1) * alpha, deta, Dtype(1), center);
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(LMCenterLossLayer);
+#endif
+
+INSTANTIATE_CLASS(LMCenterLossLayer);
+REGISTER_LAYER_CLASS(LMCenterLoss);
+
+}  // namespace caffe

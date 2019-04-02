@@ -1,0 +1,41 @@
+#ifndef CAFFE_TRANSFORMATION_STABILITY_LOSS_LAYER_HPP_
+#define CAFFE_TRANSFORMATION_STABILITY_LOSS_LAYER_HPP_
+
+#include <vector>
+
+#include "caffe/blob.hpp"
+#include "caffe/layer.hpp"
+#include "caffe/proto/caffe.pb.h"
+
+#include "caffe/layers/loss_layer.hpp"
+
+
+namespace caffe{
+template <typename Dtype>
+class TransformationStabilityLossLayer : public LossLayer<Dtype> {
+ public:
+  explicit TransformationStabilityLossLayer(const LayerParameter& param)
+      : LossLayer<Dtype>(param) {}
+  virtual void LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top);
+      
+  virtual inline int ExactNumBottomBlobs() const { return -1; }//输入不确定时候需要先加这个
+  virtual inline int MinBottomBlobs() const { return 2; }//no label input, each bottom is a transformation version
+  virtual inline const char* type() const { return "TransformationStabilityLoss"; }
+  virtual inline int ExactNumTopBlobs() const { return 1; }
+
+
+ protected:
+  /// @copydoc ContrastiveLossLayer
+  virtual void Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top);
+ // virtual void Forward_gpu(const vector<Blob<Dtype>*>& bottom,
+    //  const vector<Blob<Dtype>*>& top);
+  virtual void Backward_cpu(const vector<Blob<Dtype>*>& top,
+      const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom);
+      
+  Blob<Dtype> temp_;
+};
+}
+
+#endif

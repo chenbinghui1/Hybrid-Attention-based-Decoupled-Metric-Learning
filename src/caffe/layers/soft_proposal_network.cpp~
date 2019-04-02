@@ -1,0 +1,127 @@
+#include <vector>
+#include <opencv2/core/core.hpp>
+#include "caffe/layers/soft_proposal_network.hpp"
+#include "caffe/util/math_functions.hpp"
+#include "opencv2/opencv.hpp"
+#include "caffe/layer.hpp"
+#include <cmath>
+
+namespace caffe {
+
+template<typename Dtype>
+void SoftProposalNetworkLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+        const vector<Blob<Dtype>*>& top) {
+}
+
+template<typename Dtype>
+void SoftProposalNetworkLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+        const vector<Blob<Dtype>*>& top) {
+    vector<int> top_shape = bottom[0]->shape();
+    top[0]->Reshape(top_shape);
+    M_.Reshape(1,1,bottom[0]->shape(3)*bottom[0]->shape(3),1);
+    D_.Reshape(1,1,bottom[0]->shape(3)*bottom[0]->shape(3),bottom[0]->shape(3)*bottom[0]->shape(3));
+    tmp_.Reshape(1,bottom[0]->shape(3)*bottom[0]->shape(3),1,1);
+    tmp_M_.Reshape(1,1,bottom[0]->shape(3)*bottom[0]->shape(3),1);
+    
+    //gpu code
+    max_.Reshape(1,1,1,1);
+    min_.Reshape(1,1,1,1);
+}
+
+template<typename Dtype>
+void SoftProposalNetworkLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+        const vector<Blob<Dtype>*>& top) {
+
+	const int N = bottom[0]->shape(3);
+	const int channels = bottom[0]->channels();
+	const Dtype ems = Dtype(0.15*N);
+	
+	Dtype* top_data_cpu = top[0]->mutable_cpu_data();
+	const Dtype* features = bottom[0]->cpu_data();// feature maps
+	Dtype* tmp = tmp_.mutable_cpu_data();
+	Dtype* M = M_.mutable_cpu_data();
+	Dtype* tmp_M = tmp_M_.mutable_cpu_data();
+	Dtype* D = D_.mutable_cpu_data();
+
+	for (int n = 0; n<bottom[0]->shape(0); n++)
+	{
+		
+		//compute transforming matrix
+		caffe_set(N*N, Dtype(1.0/N/N), M);
+		for(int j=0; j<N*N; j++)
+		{
+		        for(int k=j; k<N*N; k++)
+		        {
+		                Dtype ans = 0;
+		                for(int i=0; i<channels; i++)
+		                {
+		                        ans+=(features[n*N*N*channels + i*N*N +j]-features[n*N*N*channels + i*N*N + k])*(features[n*N*N*channels + i*N*N +j]-features[n*N*N*channels + i*N*N + k]);
+		                }
+		                ans = ans==0 ? 0 : std::sqrt(ans);
+		                D[j*N*N+k] = Dtype(ans * std::exp(-((std::floor(j/N)-std::floor(k/N))*(std::floor(j/N)-std::floor(k/N)) + (j%N-k%N)*(j%N-k%N))/(Dtype(2)*ems*ems)));
+		                D[k*N*N+j] = D[j*N*N+k];
+		        }
+		}
+		caffe_set(tmp_.count(), Dtype(0), tmp);
+		for(int k=0; k<N*N; k++)
+		{
+		        for(int j=0; j<N*N; j++)
+		        {
+		                tmp[k]+=D[j*N*N+k];
+		               
+		        }
+		      
+		}
+		for(int k=0; k<N*N; k++)
+		{
+		        for(int j=0; j<N*N; j++)
+		        {
+		                D[j*N*N+k]/=tmp[k];
+		        }
+		}
+		//compute stable M
+		for(int i=0; i<10; i++)
+		{
+		        caffe_cpu_gemm(CblasNoTrans, CblasNoTrans, N*N, 1, N*N, Dtype(1), D, M, Dtype(0), tmp_M);
+		        caffe_copy(N*N, tmp_M, M);
+		}
+		//scale M
+		Dtype max_M=0,min_M=100000;
+		for (int i=0; i<N*N; i++)
+		{
+		        max_M = max_M > M[i] ? max_M : M[i];
+		        min_M = min_M < M[i] ? min_M : M[i];
+		}
+		
+		//copy to top_data_cpu
+		for(int i=0; i<channels; i++)
+		{
+		        for(int j=0; j<N*N; j++)
+		        {
+		                top_data_cpu[n*N*N*channels + i*N*N + j] = (M[j]-min_M)/(max_M-min_M);
+		        }
+		}
+
+		
+	}
+	
+
+}
+
+
+
+template<typename Dtype>
+void SoftProposalNetworkLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+        const vector<bool>& propagate_down,
+        const vector<Blob<Dtype>*>& bottom) {
+        caffe_set(bottom[0]->count(),Dtype(0),bottom[0]->mutable_cpu_diff());
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(SoftProposalNetworkLayer);
+#endif
+
+INSTANTIATE_CLASS(SoftProposalNetworkLayer);
+REGISTER_LAYER_CLASS(SoftProposalNetwork);
+
+}  // namespace caffe

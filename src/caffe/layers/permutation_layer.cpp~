@@ -1,0 +1,62 @@
+#include <algorithm>
+#include <vector>
+#include "caffe/filler.hpp"
+#include "caffe/layers/permutation_layer.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void PermutationLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+  CHECK_GE(bottom[0]->num_axes(), 2)
+      << "Number of axes of bottom blob must be >=2.";
+}
+
+template <typename Dtype>
+void PermutationLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+  CHECK_GE(bottom[0]->num_axes(), 2)
+      << "Number of axes of bottom blob must be >=2.";
+  top[0]->ReshapeLike(*bottom[0]);
+  permutation_.reset(new Blob<Dtype>(bottom[0]->shape()));
+  //permutation_->Reshape(bottom[0]->num(),bottom[0]->channels(),1,1);
+}
+
+template <typename Dtype>
+void PermutationLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+ /* const Dtype* bottom_data = bottom[0]->cpu_data();
+  Dtype* top_data = top[0]->mutable_cpu_data();
+  const int num = bottom[0]->num();
+  const int channels = bottom[0]->channels();
+  Dtype scale = this->layer_param_.permutation_param().scale();
+   shared_ptr<Filler<Dtype> > weight_filler(GetFiller<Dtype>(
+        this->layer_param_.permutation_param().weight_filler()));
+    weight_filler->Fill(permutation_);
+    
+    for(int i = 0; i < num; i++)
+    {
+        //normalize permutation_
+        Dtype norm = std::sqrt(caffe_cpu_dot(channels, permutation_->cpu_data() + i * channels, permutation_->cpu_data() + i * channels));
+        caffe_cpu_scale(channels, Dtype(1)*scale/norm, permutation_->cpu_data() + i * channels, permutation_->mutable_cpu_data() + i * channels);
+        caffe_add(channels, bottom_data + i * channels, permutation_->cpu_data() + i * channels, top_data + i * channels);
+    }*/
+}
+
+template <typename Dtype>
+void PermutationLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down,
+    const vector<Blob<Dtype>*>& bottom) {
+  if (propagate_down[0]) {
+        caffe_copy(bottom[0]->count(),top[0]->cpu_diff(),bottom[0]->mutable_cpu_diff());
+  }
+}
+
+
+#ifdef CPU_ONLY
+STUB_GPU(PermutationLayer);
+#endif
+
+INSTANTIATE_CLASS(PermutationLayer);
+REGISTER_LAYER_CLASS(Permutation);
+}  // namespace caffe

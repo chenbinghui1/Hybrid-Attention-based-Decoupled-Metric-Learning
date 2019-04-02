@@ -1,0 +1,56 @@
+#include <vector>
+
+#include "caffe/filler.hpp"
+#include "caffe/layers/kronecker_product_layer.hpp"
+#include "caffe/util/math_functions.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void KroneckerProductLayer<Dtype>::Forward_gpu(const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+      //LOG(INFO)<<bottom[0]->channels() << "  " << bottom[1]->channels();
+    const int num = bottom[0]->num();
+    const int channels0 = bottom[0]->channels();
+    const int channels1 = bottom[1]->channels();
+    
+    const Dtype* bottom_data0 = bottom[0]->gpu_data();
+    const Dtype* bottom_data1 = bottom[1]->gpu_data();
+    Dtype* top_data = top[0]->mutable_gpu_data();
+    
+    for(int i = 0; i < num; i++)
+    {
+        caffe_gpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, channels0, channels1, 1, Dtype(1.0), bottom_data0 + i * channels0, bottom_data1 + i * channels1, Dtype(0.0), top_data + i * channels0 * channels1);//compute kronecker product by matrix multiplication
+    }
+}
+
+
+
+template <typename Dtype>
+void KroneckerProductLayer<Dtype>::Backward_gpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down,
+    const vector<Blob<Dtype>*>& bottom) {
+    
+    const int num = bottom[0]->num();
+    const int channels0 = bottom[0]->channels();
+    const int channels1 = bottom[1]->channels();
+    
+    const Dtype* bottom_data0 = bottom[0]->gpu_data();
+    const Dtype* bottom_data1 = bottom[1]->gpu_data();
+    const Dtype* top_diff = top[0]->gpu_diff();
+    Dtype* bottom_diff0 = bottom[0]->mutable_gpu_diff();
+    Dtype* bottom_diff1 = bottom[1]->mutable_gpu_diff();
+    
+    for(int i = 0; i < num ; i++)
+    {
+        //gradients for bottom_data0
+        caffe_gpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, channels0, 1, channels1, Dtype(1.0), top_diff + i * channels0 * channels1, bottom_data1 + i * channels1, Dtype(0.0), bottom_diff0 + i * channels0);
+        //gradients for bottom_data1
+        caffe_gpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, 1, channels1, channels0, Dtype(1.0), bottom_data0 + i * channels0, top_diff + i * channels0 * channels1, Dtype(0.0), bottom_diff1 + i * channels1);
+        
+    }
+}
+
+INSTANTIATE_LAYER_GPU_FUNCS(KroneckerProductLayer);
+
+}  // namespace caffe

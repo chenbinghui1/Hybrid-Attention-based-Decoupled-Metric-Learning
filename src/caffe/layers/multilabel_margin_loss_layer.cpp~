@@ -1,0 +1,75 @@
+//multilabel margin loss, refer to pytorch multilabelmarginloss
+#include <algorithm>
+
+#include "stdio.h"
+#include "caffe/layers/multilabel_margin_loss_layer.hpp"
+#include "caffe/util/io.hpp"
+#include "caffe/util/math_functions.hpp"
+#include <cmath>
+
+namespace caffe {
+
+template <typename Dtype>
+void MultilabelMarginLossLayer<Dtype>::LayerSetUp(
+  const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  LossLayer<Dtype>::LayerSetUp(bottom, top);
+  CHECK_EQ(bottom[0]->height(), 1);
+  CHECK_EQ(bottom[0]->width(), 1);
+  CHECK_EQ(bottom[0]->count(),bottom[1]->count())<<"bottom inputs must have the same dimensions";
+
+}
+template <typename Dtype>
+void MultilabelMarginLossLayer<Dtype>::Forward_cpu(
+    const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+    const Dtype* label = bottom[1]->cpu_data();//0 indicates negative, 2 indecates positive, 1 should be ignored;
+    Dtype* data = bottom[0]->mutable_cpu_data();
+    int num = bottom[0]->num();//
+    int channels = bottom[0]->channels;
+
+    Dtype loss = 0.;
+
+    for(int i = 0; i < num; i++)
+    {
+        for(int j = 0; j < channels; j++)
+        {
+                if(label[i*channels + j]==int(2))
+                {
+                        for(int k = 0; k < channels; k++){
+                                if(label[i*channels+k]==int(0))
+                                {        
+                                        loss+=std::max(Dtype(0), Dtype(1.0-data[i*channels + j] + data[i*channels + k]));
+                                        //compute gradients
+                                        if(Dtype(1.0-data[i*channels + j] + data[i*channels + k])>=0){
+                                                bottom[0]->mutable_cpu_diff()[i*channels + j]+=Dtype(-1);
+                                                bottom[0]->mutable_cpu_diff()[i*channels + k]+=Dtype(1);
+                                        }
+                                }
+                        }
+                }
+        }
+    }
+    top[0]->mutable_cpu_data()[0]=loss/num/channels;
+}
+
+     
+
+template <typename Dtype>
+void MultilabelMarginLossLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+	const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) 
+{
+    //update gradients
+     caffe_cpu_scale(bottom[0]->count(), Dtype(top[0]->cpu_diff()[0]/bottom[0]->num()/bottom[0]->channels()), bottom[0]->cpu_data(), bottom[0]->mutable_cpu_diff());
+}
+
+
+
+
+#ifdef CPU_ONLY
+STUB_GPU(MultilabelMarginLossLayer);
+#endif
+
+INSTANTIATE_CLASS(MultilabelMarginLossLayer);
+REGISTER_LAYER_CLASS(MultilabelMarginLoss);
+
+}  // namespace caffe

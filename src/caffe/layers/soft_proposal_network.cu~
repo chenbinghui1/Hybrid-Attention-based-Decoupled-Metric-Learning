@@ -1,0 +1,106 @@
+#include "caffe/layers/soft_proposal_network.hpp"
+#include "caffe/util/math_functions.hpp"
+#include "caffe/layer.hpp"
+
+
+namespace caffe {
+template <typename Dtype>
+__global__ void transforming_matrix(const int n, const int N, const int channels, const Dtype ems, Dtype* D, const Dtype* features) {
+  CUDA_KERNEL_LOOP(index, N*N*N*N) {
+        int j = index/(N*N);
+        int k = index%(N*N);
+        Dtype ans = 0;
+	for(int i=0; i<channels; i++)
+	{
+		ans+=(features[n*N*N*channels + i*N*N +j]-features[n*N*N*channels + i*N*N + k])*(features[n*N*N*channels + i*N*N +j]-features[n*N*N*channels + i*N*N + k]);
+	}
+	ans = sqrt(ans);
+	D[j*N*N+k] = Dtype(ans * exp(-((j/N-k/N)*(j/N-k/N) + (j%N-k%N)*(j%N-k%N))/(Dtype(2)*ems*ems)));
+  }
+}
+
+template <typename Dtype>
+__global__ void sum_column(const int N, Dtype* D, Dtype* tmp) {
+  CUDA_KERNEL_LOOP(index, N*N) {
+        for(int j=0; j<N*N; j++)
+        {
+		tmp[index]+=D[j*N*N+index];
+		               
+	}
+  }
+}
+
+template <typename Dtype>
+__global__ void div_column(const int N, Dtype* D, Dtype* tmp) {
+  CUDA_KERNEL_LOOP(index, N*N*N*N) {
+        int k = index/(N*N);
+        int j = index%(N*N);
+        D[j*N*N+k]/=tmp[k];
+  }
+}
+
+template <typename Dtype>
+__global__ void find_max_min(const int N, Dtype* max_M, Dtype* min_M, Dtype* M) {
+  CUDA_KERNEL_LOOP(index, 1) {
+                for (int i=0; i<N*N; i++)
+		{
+		        max_M[0] = max_M[0] > M[i] ? max_M[0] : M[i];
+		        min_M[0] = min_M[0] < M[i] ? min_M[0] : M[i];
+		}
+  }
+}
+
+template <typename Dtype>
+__global__ void copy_gpu_data(const int n, const int N, const int channels, Dtype* M, Dtype* max_M, Dtype* min_M, Dtype* top_data_gpu) {
+  CUDA_KERNEL_LOOP(index, N*N*channels) {
+        int i = index/(N*N);
+        int j = index%(N*N);
+        top_data_gpu[n*N*N*channels + i*N*N + j] = (M[j]-min_M[0])/(max_M[0]-min_M[0]);
+  }
+}
+
+template<typename Dtype>
+void SoftProposalNetworkLayer<Dtype>::Forward_gpu(const vector<Blob<Dtype>*>& bottom,
+        const vector<Blob<Dtype>*>& top) {
+        const int N = bottom[0]->shape(3);
+	const int channels = bottom[0]->channels();
+	const Dtype ems = Dtype(0.15*N);
+	
+	Dtype* top_data_gpu = top[0]->mutable_gpu_data();
+	const Dtype* features = bottom[0]->gpu_data();// feature maps
+	Dtype* tmp = tmp_.mutable_gpu_data();
+	Dtype* M = M_.mutable_gpu_data();
+	Dtype* tmp_M = tmp_M_.mutable_gpu_data();
+	Dtype* D = D_.mutable_gpu_data();
+        
+        for (int n = 0; n<bottom[0]->shape(0); n++)
+	{
+	        caffe_gpu_set(N*N, Dtype(1.0/N/N), M);
+	        transforming_matrix<Dtype><<<CAFFE_GET_BLOCKS(N*N*N*N), CAFFE_CUDA_NUM_THREADS>>>(n, N, channels, ems, D, features);
+	        caffe_gpu_set(tmp_.count(), Dtype(0), tmp);
+	        sum_column<Dtype><<<CAFFE_GET_BLOCKS(N*N), CAFFE_CUDA_NUM_THREADS>>>(N,D,tmp);
+	        div_column<Dtype><<<CAFFE_GET_BLOCKS(N*N*N*N), CAFFE_CUDA_NUM_THREADS>>>(N, D, tmp);
+	        for(int i=0; i<10; i++)
+		{
+		        caffe_gpu_gemm(CblasNoTrans, CblasNoTrans, N*N, 1, N*N, Dtype(1), D, M, Dtype(0), tmp_M);
+		        caffe_copy(N*N, tmp_M, M);
+		}
+		caffe_gpu_set(1,Dtype(0),max_.mutable_gpu_data());
+		caffe_gpu_set(1,Dtype(10000),min_.mutable_gpu_data());
+		find_max_min<Dtype><<<CAFFE_GET_BLOCKS(1), CAFFE_CUDA_NUM_THREADS>>>(N, max_.mutable_gpu_data(), min_.mutable_gpu_data(), M);
+		copy_gpu_data<Dtype><<<CAFFE_GET_BLOCKS(N*N*channels), CAFFE_CUDA_NUM_THREADS>>>(n, N, channels, M, max_.mutable_gpu_data(), min_.mutable_gpu_data(), top_data_gpu);
+	
+	}
+}
+
+
+template<typename Dtype>
+void SoftProposalNetworkLayer<Dtype>::Backward_gpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down,
+    const vector<Blob<Dtype>*>& bottom) {
+        caffe_gpu_set(bottom[0]->count(),Dtype(0),bottom[0]->mutable_gpu_diff());
+}
+
+INSTANTIATE_LAYER_GPU_FUNCS(SoftProposalNetworkLayer);
+
+}

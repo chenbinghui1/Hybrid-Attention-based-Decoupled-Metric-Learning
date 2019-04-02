@@ -1,0 +1,195 @@
+//iccv17 look closer to see better
+#include <vector>
+#include <opencv2/core/core.hpp>
+#include "caffe/layers/attention_crop_layer.hpp"
+#include "caffe/util/math_functions.hpp"
+#include "opencv2/opencv.hpp"
+#include "caffe/util/rng.hpp"
+#include "caffe/layer.hpp"
+#define ek 0.05
+#define core 3
+
+namespace caffe {
+
+template<typename Dtype>
+void AttentionCropLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+        const vector<Blob<Dtype>*>& top) {
+    // nothing should be done here
+
+}
+
+template<typename Dtype>
+void AttentionCropLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+        const vector<Blob<Dtype>*>& top) {
+    // then assign the shape of the top blob
+    vector<int> top_shape = bottom[0]->shape();
+	top_shape[2] = out_size;
+	top_shape[3] = out_size;
+    top[0]->Reshape(top_shape);
+}
+
+template<typename Dtype>
+void AttentionCropLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+        const vector<Blob<Dtype>*>& top) {
+	Dtype mean_value[3] = { mean_value1, mean_value2, mean_value3 };
+	Dtype* top_data_cpu = top[0]->mutable_cpu_data();
+	const Dtype* bottom_data_0 = bottom[0]->cpu_data();// scale 1 output data
+	const Dtype* bottom_data_1 = bottom[1]->cpu_data();// tx ty tl
+
+	cv::Mat cv_img = cv::Mat(bottom[0]->shape(2), bottom[0]->shape(2), CV_8UC3);
+	cv::Mat out_cv_img = cv::Mat(out_size, out_size, CV_8UC3);
+	int bottom_index;
+	int in_size = bottom[0]->shape(2);
+	//convert blob to cv::mat
+	for (int n = 0; n<bottom[0]->shape(0); n++)
+	{
+		Dtype a = bottom_data_1[n * 3];//tx
+		Dtype b = bottom_data_1[n * 3 + 1];//ty
+		Dtype c = bottom_data_1[n * 3 + 2];//tl
+		c = c>0.01 * in_size ? c : 0.01 * in_size;
+		int w_off = int(a - c > 0 ? a - c : 0);//x axis 开始坐标
+		int h_off = int(b - c > 0 ? b - c : 0);//y axis 开始坐标
+		int w_end = int((a + c) < in_size ? (a + c) : in_size);//x axis 结束坐标
+		int h_end = int((b + c) < in_size ? (b + c) : in_size);//y axis 结束坐标
+		for (int i = 0; i < bottom[0]->shape(2); i++)//h
+		{
+			uchar* ptr = cv_img.ptr<uchar>(i);
+			int img_index = 0;
+			for (int j = 0; j < bottom[0]->shape(2); j++)//w
+			{
+				for (int k = 0; k < 3; k++)//c
+				{
+					bottom_index = n * bottom[0]->count(1) + (k * bottom[0]->shape(2) + i) * bottom[0]->shape(2) + j;
+					ptr[img_index++] = bottom_data_0[bottom_index] + mean_value[k];
+				}
+			}
+		}
+		//use cv::method to perform cropping
+
+		cv::Rect roi(w_off, h_off, w_end - w_off, h_end - h_off);
+		cv::Mat cv_cropped_img = cv_img(roi);
+
+		cv::resize(cv_cropped_img, out_cv_img, out_cv_img.size(), 0, 0, cv::INTER_LINEAR);
+		//cv::imshow("1",cv_img);
+		//cv::imshow("2",out_cv_img);
+		//cvWaitKey(0);
+		int top_index;
+		for (int i = 0; i < out_size; i++)//h
+		{
+			const uchar* ptr = out_cv_img.ptr<uchar>(i);
+			int img_index = 0;
+			for (int j = 0; j < out_size; j++)//w
+			{
+
+				for (int k = 0; k < 3; k++)//c
+				{
+					Dtype pixel = static_cast<Dtype>(ptr[img_index++]);
+					top_index = n * top[0]->count(1) + (k * out_size + i) * out_size + j;
+					top_data_cpu[top_index] = pixel - mean_value[k];
+				}
+
+
+			}
+		}
+	}
+
+}
+
+
+template<typename Dtype>
+Dtype H(Dtype x){
+	return 1 / (1 + exp(-ek*x));
+}
+
+template<typename Dtype>
+Dtype diff_H(Dtype x){
+	return ek * exp(-ek*x) / ((1 + exp(-ek*x))*(1 + exp(-ek*x)));
+}
+
+template<typename Dtype>
+Dtype F(Dtype a, Dtype b, Dtype c, Dtype x, Dtype y) {
+	return (H(x - (a - c)) - H(x - (a + c)))*(H(y - (b - c)) - H(y - (b + c)));
+}
+
+template<typename Dtype>
+Dtype diff_F_a(Dtype a, Dtype b, Dtype c, Dtype x, Dtype y) {
+	return (diff_H(x - (a - c)) - diff_H(x - (a + c)))*(H(y - (b - c)) - H(y - (b + c)));
+}
+
+template<typename Dtype>
+Dtype diff_F_b(Dtype a, Dtype b, Dtype c, Dtype x, Dtype y) {
+	return (diff_H(y - (b - c)) - diff_H(y - (b + c)))*(H(x - (a - c)) - H(x - (a + c)));
+}
+
+template<typename Dtype>
+Dtype diff_F_c(Dtype a, Dtype b, Dtype c, Dtype x, Dtype y) {
+	return -((diff_H(y - (b - c)) + diff_H(y - (b + c)))*(H(x - (a - c)) - H(x - (a + c))) + (diff_H(x - (a - c)) + diff_H(x - (a + c)))*(H(y - (b - c)) - H(y - (b + c)))) + 0.005;
+}
+
+
+template<typename Dtype>
+void AttentionCropLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+        const vector<bool>& propagate_down,
+        const vector<Blob<Dtype>*>& bottom) {
+	const Dtype* top_diff = top[0]->cpu_diff();
+	Dtype* bottom_diff_cpu = bottom[1]->mutable_cpu_diff();//tx ty tl diff
+	const Dtype* bottom_data = bottom[1]->cpu_data();//tx ty tl data
+	caffe_set(bottom[1]->count(), Dtype(0.0), bottom_diff_cpu);
+	int count_1 = top[0]->count(1);//h*w*c
+	int count_2 = top[0]->count(2);//h*w
+	int count_3 = top[0]->count(3);//h
+	Dtype a;
+	Dtype b;
+	Dtype c;
+	for (int i = 0; i < top[0]->shape(0); i++)//n
+	{
+		a = bottom_data[i * 3];//tx
+		b = bottom_data[i * 3 + 1];//ty
+		c = bottom_data[i * 3 + 2];//tl
+		for (int j = 0; j < top[0]->shape(1); j++)//c
+		{
+			Dtype max_diff = 0;
+			for (int k = 0; k < top[0]->shape(2); k++)//h
+			{
+				for (int l = 0; l < top[0]->shape(3); l++)//w
+				{
+					int top_index = i * count_1 + j * count_2 + k * count_3 + l;
+					Dtype top = top_diff[top_index]>0 ? top_diff[top_index] : -top_diff[top_index];
+					if (top > max_diff)
+					{
+						max_diff = top;// find max abs(top_diff) for each channel
+					}
+				}
+			}
+			for (int k = 0; k < top[0]->shape(2); k++)
+			{
+				for (int l = 0; l < top[0]->shape(3); l++)
+				{
+					int top_index = i * count_1 + j * count_2 + k * count_3 + l;
+					Dtype top = top_diff[top_index]>0 ? top_diff[top_index] : -top_diff[top_index];
+					if (max_diff > 0)
+					{
+						top = top / max_diff * 0.0000001;//?
+					}
+					Dtype x = a - c + 2 * l * c / out_size;//compute original x based on current l
+					Dtype y = b - c + 2 * k * c / out_size;//compute original y based on current k
+					bottom_diff_cpu[3 * i + 0] += top * diff_F_a(a, b, c, x, y);
+					bottom_diff_cpu[3 * i + 1] += top * diff_F_b(a, b, c, x, y);
+					bottom_diff_cpu[3 * i + 2] += top * diff_F_c(a, b, c, x, y);
+
+				}
+			}
+		}
+	}
+
+
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(AttentionCropLayer);
+#endif
+
+INSTANTIATE_CLASS(AttentionCropLayer);
+REGISTER_LAYER_CLASS(AttentionCrop);
+
+}  // namespace caffe

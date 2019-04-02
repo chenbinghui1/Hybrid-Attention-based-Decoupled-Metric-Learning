@@ -1,0 +1,81 @@
+//hardman loss
+#include <algorithm>
+#include <vector>
+#include "stdio.h"
+#include "caffe/filler.hpp"
+#include "caffe/layer.hpp"
+#include "caffe/layers/hardman_loss_layer.hpp"
+#include "caffe/util/io.hpp"
+#include "caffe/util/math_functions.hpp"
+#include <cmath>
+/**********************/
+/**/
+namespace caffe {
+
+template <typename Dtype>
+void HardmanLossLayer<Dtype>::LayerSetUp(
+  const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  LossLayer<Dtype>::LayerSetUp(bottom, top);
+  CHECK_EQ(bottom[0]->height(), 1);
+  CHECK_EQ(bottom[0]->width(), 1);
+  CHECK_EQ(bottom[0]->channels(), bottom[1]->channels());
+  temp_.Reshape(bottom[0]->num(),bottom[0]->channels(),1,1);
+  diff_.Reshape(bottom[0]->num(),bottom[0]->channels(), 1, 1);
+}
+template <typename Dtype>
+void HardmanLossLayer<Dtype>::Forward_cpu(
+    const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+    const Dtype* data = bottom[0]->cpu_data();
+    const Dtype* label = bottom[1]->cpu_data();//hardman code label
+    
+    int num = bottom[0]->num();//
+    int channels = bottom[0]->channels();
+
+    Dtype alpha = this->layer_param_.hardman_loss_param().alpha();
+    Dtype gamma = this->layer_param_.hardman_loss_param().gamma();
+    
+    Dtype loss = 0;
+    top[0]->mutable_cpu_data()[0]=0;
+    
+    //compute loss
+    caffe_cpu_axpby(channels*num, Dtype(1), data, Dtype(0),temp_.mutable_cpu_data());
+    caffe_cpu_axpby(channels*num, Dtype(-1), label, Dtype(1), temp_.mutable_cpu_data());
+    top[0]->mutable_cpu_data()[0] = alpha * caffe_cpu_dot(channels*num, temp_.cpu_data(), temp_.cpu_data()) * Dtype(0.5) / num;
+    for(int i = 0; i < num; i++)
+    {
+        Dtype loss1 = caffe_cpu_asum(channels, data + i * channels);
+        loss += std::abs(loss1);
+        //gradients
+        if(loss1>=Dtype(1) || (loss1<=Dtype(0.0) && loss1>=Dtype(-1.0)))
+                caffe_set(channels, gamma, diff_.mutable_cpu_data() + i * channels);
+        else
+                caffe_set(channels, Dtype(-1) * gamma, diff_.mutable_cpu_data() + i * channels);
+    }
+    top[0]->mutable_cpu_data()[0] += gamma * loss / num;
+}
+
+     
+
+template <typename Dtype>
+void HardmanLossLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+	const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) 
+{
+    int num = bottom[0]->num();//
+    int channels = bottom[0]->channels();
+    caffe_cpu_axpby(num*channels, top[0]->cpu_diff()[0]/num, diff_.cpu_data(), Dtype(0), bottom[0]->mutable_cpu_diff());
+    caffe_cpu_axpby(num*channels, top[0]->cpu_diff()[0] * this->layer_param_.hardman_loss_param().alpha() / num, temp_.cpu_data(), Dtype(1), bottom[0]->mutable_cpu_diff());
+    
+}
+
+
+
+
+#ifdef CPU_ONLY
+STUB_GPU(HardmanLossLayer);
+#endif
+
+INSTANTIATE_CLASS(HardmanLossLayer);
+REGISTER_LAYER_CLASS(HardmanLoss);
+
+}  // namespace caffe

@@ -1,0 +1,126 @@
+//adverse_generator_loss CVPR18  associ with adverse_batch_construct & kcenterv2_adv_loss 
+//now only support for N*2 batches
+#include <algorithm>
+#include <vector>
+#include "stdio.h"
+#include "caffe/layer.hpp"
+#include "caffe/layers/adverse_generator_loss.hpp"
+#include "caffe/util/io.hpp"
+#include "caffe/util/math_functions.hpp"
+#include <cmath>
+/**********************/
+/**/
+namespace caffe {
+
+template <typename Dtype>
+void AdverseGeneratorLossLayer<Dtype>::LayerSetUp(
+  const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  LossLayer<Dtype>::LayerSetUp(bottom, top);
+  
+  CHECK_EQ(bottom[0]->height(), 1);
+  CHECK_EQ(bottom[0]->width(), 1);
+  CHECK_EQ(bottom[0]->channels(), bottom[1]->channels());
+}
+template <typename Dtype>
+void AdverseGeneratorLossLayer<Dtype>::Reshape(
+    const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  vector<int> loss_shape(0);  // Loss layers output a scalar; 0 axes.
+  top[0]->Reshape(loss_shape);
+  temp_.Reshape(1,1,1,bottom[0]->channels());
+  temp1_.Reshape(1,1,1,bottom[0]->channels());
+}
+
+template <typename Dtype>
+void AdverseGeneratorLossLayer<Dtype>::Forward_cpu(
+    const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+    int channels = bottom[1]->channels();
+    const Dtype* data0 = bottom[0]->cpu_data();
+    const Dtype* data1 = bottom[1]->cpu_data();//generated data
+    Dtype lamda1 = this->layer_param_.adverse_generator_loss_param().lamda1();
+    Dtype lamda2 = this->layer_param_.adverse_generator_loss_param().lamda2();
+    Dtype margin = this->layer_param_.adverse_generator_loss_param().margin();
+    int class_num = this->layer_param_.adverse_generator_loss_param().class_num();
+    int image_num_per_class = bottom[0]->num() / class_num;
+    Dtype* temp = temp_.mutable_cpu_data();
+    Dtype* temp1 = temp1_.mutable_cpu_data();
+    Dtype loss = 0.0;
+    caffe_set(bottom[1]->count(), Dtype(0), bottom[1]->mutable_cpu_diff());
+    //for everay negative generator
+     for(int i = 0; i < class_num; i++){
+                for(int j = 0; j < class_num ; j++){
+                        if(i < j){
+                                
+                                // |x_g -x_n| * lamda1
+                                caffe_sub(channels, data1 + i * (class_num - 1) * channels + (j - 1) * channels, data0 + j * image_num_per_class * channels + channels, temp);
+                                loss = loss + lamda1*caffe_cpu_dot(channels, temp, temp)/2.0;
+                                  //gradients for x_g, no need for x_n
+                                caffe_axpy(channels, lamda1, temp, bottom[1]->mutable_cpu_diff() + i * (class_num - 1) * channels + (j - 1) * channels);
+                                
+                                // |x_g - x|
+                                caffe_sub(channels, data1 + i * (class_num - 1) * channels + (j - 1) * channels, data0 + i * channels * image_num_per_class, temp);
+                                Dtype loss_temp = caffe_cpu_dot(channels, temp, temp) / 2.0;
+                                loss += loss_temp;
+                                  //gradients for x_g, no need for x
+                                caffe_axpy(channels, Dtype(1), temp, bottom[1]->mutable_cpu_diff() + i * (class_num - 1) * channels + (j - 1) * channels);
+                                
+                                //for [D(x_g,x) - D(x, x+) - margin]_{+}, D:L2
+                                // |x^+ - x|
+                                caffe_sub(channels, data0 + i * channels * image_num_per_class, data0 + i * channels * image_num_per_class + channels, temp1);
+                                Dtype loss_temp1 = caffe_cpu_dot(channels, temp1, temp1) / 2.0;
+                                loss = loss + lamda2 * std::max(Dtype(0), loss_temp - loss_temp1 - margin);
+                                  //gradients for x_g only
+                                if(loss_temp - loss_temp1 - margin > Dtype(0)){
+                                        caffe_axpy(channels, Dtype(lamda2), temp, bottom[1]->mutable_cpu_diff() + i * (class_num - 1) * channels + (j - 1) * channels);
+                                }
+                        }
+                        else if(i > j){
+                                // |x_g -x_n| * lamda1
+                                caffe_sub(channels, data1 + i * (class_num - 1) * channels + j * channels, data0 + j * image_num_per_class * channels + channels, temp);
+                                loss = loss + lamda1*caffe_cpu_dot(channels, temp, temp)/2.0;
+                                  //gradients for x_g, no need for x_n
+                                caffe_axpy(channels, lamda1, temp, bottom[1]->mutable_cpu_diff() + i * (class_num - 1) * channels + j * channels);
+                                
+                                // |x_g - x|
+                                caffe_sub(channels, data1 + i * (class_num - 1) * channels + j * channels, data0 + i * channels * image_num_per_class, temp);
+                                Dtype loss_temp = caffe_cpu_dot(channels, temp, temp) / 2.0;
+                                loss += loss_temp;
+                                  //gradients for x_g, no need for x
+                                caffe_axpy(channels, Dtype(1), temp, bottom[1]->mutable_cpu_diff() + i * (class_num - 1) * channels + j * channels);
+                                
+                                //for [D(x_g,x) - D(x, x+) - margin]_{+}, D:L2
+                                // |x^+ - x|
+                                caffe_sub(channels, data0 + i * channels * image_num_per_class, data0 + i * channels * image_num_per_class + channels, temp1);
+                                Dtype loss_temp1 = caffe_cpu_dot(channels, temp1, temp1) / 2.0;
+                                loss = loss + lamda2 * std::max(Dtype(0), loss_temp - loss_temp1 - margin);
+                                  //gradients for x_g only
+                                if(loss_temp - loss_temp1 - margin > Dtype(0)){
+                                        caffe_axpy(channels, Dtype(lamda2), temp, bottom[1]->mutable_cpu_diff() + i * (class_num - 1) * channels + j * channels);
+                                }
+                        }
+                }
+      }
+      top[0]->mutable_cpu_data()[0] = loss / bottom[1]->num();
+}
+
+     
+
+template <typename Dtype>
+void AdverseGeneratorLossLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+	const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) 
+{
+        caffe_cpu_scale(bottom[1]->count(), Dtype(1)*top[0]->cpu_diff()[0]/Dtype(bottom[1]->num()), bottom[1]->cpu_diff(), bottom[1]->mutable_cpu_diff());
+        caffe_set(bottom[0]->count(), Dtype(0), bottom[0]->mutable_cpu_diff())	
+}
+
+
+
+
+#ifdef CPU_ONLY
+STUB_GPU(AdverseGeneratorLossLayer);
+#endif
+
+INSTANTIATE_CLASS(AdverseGeneratorLossLayer);
+REGISTER_LAYER_CLASS(AdverseGeneratorLoss);
+
+}  // namespace caffe

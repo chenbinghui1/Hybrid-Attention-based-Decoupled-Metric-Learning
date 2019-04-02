@@ -1,0 +1,118 @@
+//order loss only first order
+#include <algorithm>
+#include <vector>
+#include "stdio.h"
+#include "caffe/filler.hpp"
+#include "caffe/layer.hpp"
+#include "caffe/layers/order_loss_layer.hpp"
+#include "caffe/util/io.hpp"
+#include "caffe/util/math_functions.hpp"
+#include <cmath>
+/**********************/
+/**/
+namespace caffe {
+
+template <typename Dtype>
+void OrderLossLayer<Dtype>::LayerSetUp(
+  const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  LossLayer<Dtype>::LayerSetUp(bottom, top);
+  CHECK_EQ(bottom[0]->height(), 1);
+  CHECK_EQ(bottom[0]->width(), 1);
+  temp1_.Reshape(1,bottom[0]->channels(),1,1);
+  temp2_.Reshape(1,bottom[0]->channels(),1,1);
+  temp_.Reshape(1,1,this->layer_param_.order_loss_param().per_number()/2,this->layer_param_.order_loss_param().per_number()/2);
+  one_.Reshape(1,1,this->layer_param_.order_loss_param().per_number()/2,this->layer_param_.order_loss_param().per_number()/2);
+  ftemp1_.Reshape(1,1,bottom[0]->channels(),bottom[0]->channels());
+  ftemp2_.Reshape(1,1,bottom[0]->channels(),bottom[0]->channels());
+  ftemp_.Reshape(1,1,this->layer_param_.order_loss_param().per_number()/2, bottom[0]->channels());
+}
+template <typename Dtype>
+void OrderLossLayer<Dtype>::Forward_cpu(
+    const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+    const Dtype* data = bottom[0]->cpu_data();
+    
+    int num = bottom[0]->num();//
+    int channels = bottom[0]->channels();
+
+    Dtype loss = 0;
+    top[0]->mutable_cpu_data()[0]=0;
+    
+    //compute loss
+    int per_number = this->layer_param_.order_loss_param().per_number();
+    Dtype alpha1 = this->layer_param_.order_loss_param().alpha1();
+    Dtype alpha2 = this->layer_param_.order_loss_param().alpha2();
+    int class_number = num/per_number;
+    caffe_set(bottom[0]->count(), Dtype(0), bottom[0]->mutable_cpu_diff());
+    //compute I
+    caffe_set(per_number*per_number/4, Dtype(4.0/per_number/per_number), one_.mutable_cpu_data());
+    caffe_set(per_number*per_number/4, Dtype(0), temp_.mutable_cpu_data());
+    for(int i = 0; i < per_number/2; i++)
+    {
+        temp_.mutable_cpu_data()[i*per_number/2+i] = Dtype(2.0/per_number);
+    }
+    caffe_cpu_axpby(temp_.count(), Dtype(-1), one_.cpu_data(), Dtype(1), temp_.mutable_cpu_data());
+    
+    for(int i=0; i < class_number; i++)
+    {
+        //first order
+        caffe_set(channels, Dtype(0), temp1_.mutable_cpu_data());
+        for(int j=0; j<per_number/2; j++)
+        {
+               caffe_cpu_axpby(channels, Dtype(2.0/per_number), data + (i * per_number + j) * channels, Dtype(1), temp1_.mutable_cpu_data()); 
+        }
+        caffe_set(channels, Dtype(0), temp2_.mutable_cpu_data());
+        for(int j=per_number/2; j<per_number; j++)
+        {
+               caffe_cpu_axpby(channels, Dtype(2.0/per_number), data + (i * per_number + j) * channels, Dtype(1), temp2_.mutable_cpu_data()); 
+        }
+        caffe_cpu_axpby(channels, Dtype(-1), temp2_.cpu_data(), Dtype(1), temp1_.mutable_cpu_data());
+        loss= loss + alpha1 * caffe_cpu_dot(channels, temp1_.cpu_data(), temp1_.cpu_data());
+        //compute gradients
+        for(int j=0; j<per_number/2; j++)
+        {
+                caffe_cpu_axpby(channels, Dtype(2.0/per_number), temp1_.cpu_data(), Dtype(1), bottom[0]->mutable_cpu_diff() + (i * per_number + j) * channels);
+        }
+        for(int j=per_number/2; j<per_number; j++)
+        {
+                caffe_cpu_axpby(channels, Dtype(-2.0/per_number), temp1_.cpu_data(), Dtype(1), bottom[0]->mutable_cpu_diff() + (i * per_number + j) * channels);
+        }
+        //second order
+        caffe_cpu_gemm(CblasNoTrans,CblasNoTrans, per_number/2, channels, per_number/2, Dtype(1), temp_.cpu_data(), data + i * per_number * channels, Dtype(0), ftemp_.mutable_cpu_data());
+        caffe_cpu_gemm(CblasTrans,CblasNoTrans, channels, channels, per_number/2, Dtype(1), data + i * per_number * channels, ftemp_.cpu_data(), Dtype(0), ftemp1_.mutable_cpu_data());
+        
+        caffe_cpu_gemm(CblasNoTrans,CblasNoTrans, per_number/2, channels, per_number/2, Dtype(1), temp_.cpu_data(), data + (i * per_number + per_number/2) * channels, Dtype(0), ftemp_.mutable_cpu_data());
+        caffe_cpu_gemm(CblasTrans,CblasNoTrans, channels, channels, per_number/2, Dtype(1), data + (i * per_number + per_number/2) * channels, ftemp_.cpu_data(), Dtype(0), ftemp2_.mutable_cpu_data());
+        
+        caffe_cpu_axpby(ftemp1_.count(), Dtype(-1), ftemp2_.cpu_data(), Dtype(1), ftemp1_.mutable_cpu_data());
+        loss= loss+ alpha2 * caffe_cpu_dot(ftemp1_.count(), ftemp1_.cpu_data(), ftemp1_.cpu_data());
+        //compute gradients
+        caffe_cpu_gemm(CblasNoTrans, CblasNoTrans, per_number/2, channels, per_number/2, Dtype(1), temp_.cpu_data(), data + i * per_number * channels, Dtype(0), ftemp_.mutable_cpu_data());
+        caffe_cpu_gemm(CblasNoTrans, CblasNoTrans, per_number/2, channels, channels, Dtype(2.0*alpha2), ftemp_.cpu_data(), ftemp1_.cpu_data(), Dtype(1), bottom[0]->mutable_cpu_diff() + i * per_number * channels);
+        
+        caffe_cpu_gemm(CblasNoTrans, CblasNoTrans, per_number/2, channels, per_number/2, Dtype(1), temp_.cpu_data(), data + (i * per_number + per_number/2) * channels, Dtype(0), ftemp_.mutable_cpu_data());
+        caffe_cpu_gemm(CblasNoTrans, CblasNoTrans, per_number/2, channels, channels, Dtype(-2.0*alpha2), ftemp_.cpu_data(), ftemp1_.cpu_data(), Dtype(1), bottom[0]->mutable_cpu_diff() + (i * per_number + per_number/2) * channels);
+    }
+    top[0]->mutable_cpu_data()[0] = loss * 0.5 / Dtype(class_number);
+}
+
+     
+
+template <typename Dtype>
+void OrderLossLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+	const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) 
+{
+    caffe_cpu_scale(bottom[0]->count(), Dtype(top[0]->cpu_diff()[0]*1.0*this->layer_param_.order_loss_param().per_number()/bottom[0]->num()), bottom[0]->cpu_diff(), bottom[0]->mutable_cpu_diff());
+}
+
+
+
+
+#ifdef CPU_ONLY
+STUB_GPU(OrderLossLayer);
+#endif
+
+INSTANTIATE_CLASS(OrderLossLayer);
+REGISTER_LAYER_CLASS(OrderLoss);
+
+}  // namespace caffe

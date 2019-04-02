@@ -1,0 +1,1201 @@
+// for (2-k)*cos + 1 - k
+#include <vector>
+
+#include "caffe/filler.hpp"
+#include "caffe/layers/inner_product_for_large_softmax_layer.hpp"
+#include "caffe/util/math_functions.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  const int num_output = this->layer_param_.inner_product_for_large_softmax_param().num_output();
+  bias_term_ = this->layer_param_.inner_product_for_large_softmax_param().bias_term();
+  m_ = this->layer_param_.inner_product_for_large_softmax_param().m();
+  lamda_ = this->layer_param_.inner_product_for_large_softmax_param().lamda();
+  miu_ = this->layer_param_.inner_product_for_large_softmax_param().miu();
+  N_ = num_output;
+  const int axis = bottom[0]->CanonicalAxisIndex(
+      this->layer_param_.inner_product_for_large_softmax_param().axis());
+  // Dimensions starting from "axis" are "flattened" into a single
+  // length K_ vector. For example, if bottom[0]'s shape is (N, C, H, W),
+  // and axis == 1, N inner products with dimension CHW are performed.
+  K_ = bottom[0]->count(axis);
+  // Check if we need to set up the weights
+  if (this->blobs_.size() > 0) {
+    LOG(INFO) << "Skipping parameter initialization";
+  } else {
+    if (bias_term_) {
+      this->blobs_.resize(2);
+    } else {
+      this->blobs_.resize(1);
+    }
+    // Intialize the weight
+    vector<int> weight_shape(2);
+    weight_shape[0] = N_;
+    weight_shape[1] = K_;
+    this->blobs_[0].reset(new Blob<Dtype>(weight_shape));
+    // fill the weights
+    shared_ptr<Filler<Dtype> > weight_filler(GetFiller<Dtype>(
+        this->layer_param_.inner_product_for_large_softmax_param().weight_filler()));
+    weight_filler->Fill(this->blobs_[0].get());
+    // If necessary, intiialize and fill the bias term
+    if (bias_term_) {
+      vector<int> bias_shape(1, N_);
+      this->blobs_[1].reset(new Blob<Dtype>(bias_shape));
+      shared_ptr<Filler<Dtype> > bias_filler(GetFiller<Dtype>(
+          this->layer_param_.inner_product_for_large_softmax_param().bias_filler()));
+      bias_filler->Fill(this->blobs_[1].get());
+    }
+  }  // parameter initialization
+  this->param_propagate_down_.resize(this->blobs_.size(), true);
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  // Figure out the dimensions
+  const int axis = bottom[0]->CanonicalAxisIndex(
+      this->layer_param_.inner_product_for_large_softmax_param().axis());
+  const int new_K = bottom[0]->count(axis);
+  CHECK_EQ(K_, new_K)
+      << "Input size incompatible with inner product parameters.";
+  // The first "axis" dimensions are independent inner products; the total
+  // number of these is M_, the product over these dimensions.
+  M_ = bottom[0]->count(0, axis);
+  // The top shape will be the bottom shape with the flattened axes dropped,
+  // and replaced by a single axis with dimension num_output (N_).
+  vector<int> top_shape = bottom[0]->shape();
+  top_shape.resize(axis + 1);
+  top_shape[axis] = N_;
+  top[0]->Reshape(top_shape);
+  // Set up the bias multiplier
+  if (bias_term_) {
+    vector<int> bias_shape(1, M_);
+    bias_multiplier_.Reshape(bias_shape);
+    caffe_set(M_, Dtype(1), bias_multiplier_.mutable_cpu_data());
+  }
+    w_norm_.Reshape(N_,1,1,1);
+
+    x_norm_.Reshape(M_,1,1,1);
+    top_diff_copy_.Reshape(top_shape);
+    sqr_bottom.ReshapeLike(*bottom[0]);
+    sqr_w.Reshape(N_,K_,1,1);
+
+    kesi_.Reshape(1,1,1,1);
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+  const Dtype* bottom_data = bottom[0]->cpu_data();
+  const Dtype* label_ = bottom[1]->cpu_data();
+  Dtype* top_data = top[0]->mutable_cpu_data();
+  const Dtype* weight = this->blobs_[0]->cpu_data();
+  Dtype* w_norm = w_norm_.mutable_cpu_data();
+  Dtype* x_norm = x_norm_.mutable_cpu_data();
+  caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasTrans, M_, N_, K_, (Dtype)1.,
+      bottom_data, weight, (Dtype)0., top_data);
+  // compute ||x|| num=M_
+  for (int i = 0; i < M_; i++) {
+    x_norm[i] = caffe_cpu_dot<Dtype>(K_, bottom_data + i * K_, bottom_data + i * K_);
+    x_norm[i] = std::sqrt(x_norm[i]);
+  }
+  // compute ||w|| num=N_
+  for (int i = 0; i < N_; i++) {
+    w_norm[i] = caffe_cpu_dot<Dtype>(K_, weight + i * K_, weight + i * K_);
+    w_norm[i] = std::sqrt(w_norm[i]);
+  }
+  // update top[i]
+  Dtype* kesi = kesi_.mutable_cpu_data();
+
+  kesi[0] = m_;
+//LOG(INFO)<<"lamda="<<lamda_<<"    m="<<m_<<"  miu="<<miu_<<"   kesi="<<kesi[0];
+  for (int i = 0; i < M_; i++) {
+    int label = static_cast<int>(label_[i]);
+    top_data[i * N_ + label] = (lamda_ + (Dtype(1.0) - lamda_ )* (Dtype(2)-kesi[0])) * top_data[ i * N_ + label] + (Dtype(1.0) - lamda_ )*(Dtype(1.0) - kesi[0]) * w_norm[label] * x_norm[i];
+  }
+  if (bias_term_) {
+    caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, M_, N_, 1, (Dtype)1.,
+        bias_multiplier_.cpu_data(),
+        this->blobs_[1]->cpu_data(), (Dtype)1., top_data);
+  }
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down,
+    const vector<Blob<Dtype>*>& bottom) {
+  const Dtype* label_ = bottom[1]->cpu_data();
+  const Dtype* top_diff = top[0]->cpu_diff();
+  const Dtype* kesi = kesi_.cpu_data();
+  Dtype alpha1 = lamda_ + (Dtype(1.0) - lamda_)*(Dtype(2)-kesi[0]);
+  Dtype alpha2 = (Dtype(1.0) - lamda_)*(Dtype(1.0) - kesi[0]);
+  const Dtype* w_norm = w_norm_.cpu_data();
+  const Dtype* x_norm = x_norm_.cpu_data();
+// copy top_diff to top_diff_copy  
+  Dtype* top_diff_copy = top_diff_copy_.mutable_cpu_data();
+  caffe_copy(top[0]->count(), top_diff, top_diff_copy);
+// modify top_diff_copy to zero
+  for (int i = 0; i < M_; i++) {
+     caffe_set(1, Dtype(0), top_diff_copy+i*N_+static_cast<int>(label_[i]));
+  }
+    // Gradient with respect to weight
+  if (this->param_propagate_down_[0]) {
+    const Dtype* bottom_data = bottom[0]->cpu_data();
+    caffe_cpu_gemm<Dtype>(CblasTrans, CblasNoTrans, N_, K_, M_, (Dtype)1.,
+        top_diff_copy, bottom_data, (Dtype)1., this->blobs_[0]->mutable_cpu_diff());
+
+    for (int i = 0; i < M_; i++) {
+       int label = static_cast<int>(label_[i]);
+       caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], bottom_data+i*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+       caffe_axpy<Dtype>(K_, alpha2*x_norm[i]*top_diff[i*N_ + label]/w_norm[label], this->blobs_[0]->cpu_data()+label*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+    }
+    //for domain adaptation
+    int domain_num = this->layer_param_.inner_product_for_large_softmax_param().domain_num();
+    Dtype domain_weight = this->layer_param_.inner_product_for_large_softmax_param().domain_weight();
+    if(domain_num==2)
+    {
+                caffe_cpu_axpby(this->blobs_[0]->count()/domain_num, domain_weight, this->blobs_[0]->cpu_data(), Dtype(1), this->blobs_[0]->mutable_cpu_diff());
+                caffe_cpu_axpby(this->blobs_[0]->count()/domain_num, Dtype(-1)*domain_weight, this->blobs_[0]->cpu_data() + this->blobs_[0]->count()/domain_num, Dtype(1), this->blobs_[0]->mutable_cpu_diff());
+                caffe_cpu_axpby(this->blobs_[0]->count()/domain_num, domain_weight, this->blobs_[0]->cpu_data() + this->blobs_[0]->count()/domain_num, Dtype(1), this->blobs_[0]->mutable_cpu_diff() + this->blobs_[0]->count()/domain_num);
+                caffe_cpu_axpby(this->blobs_[0]->count()/domain_num, Dtype(-1)*domain_weight, this->blobs_[0]->cpu_data(), Dtype(1), this->blobs_[0]->mutable_cpu_diff() + this->blobs_[0]->count()/domain_num);
+    }
+    
+  }
+    // Gradient with respect to bias
+  if (bias_term_ && this->param_propagate_down_[1]) {
+    caffe_cpu_gemv<Dtype>(CblasTrans, M_, N_, (Dtype)1., top_diff,
+        bias_multiplier_.cpu_data(), (Dtype)1.,
+        this->blobs_[1]->mutable_cpu_diff());
+    //for domain adapation
+    int domain_num = this->layer_param_.inner_product_for_large_softmax_param().domain_num();
+    Dtype domain_weight = this->layer_param_.inner_product_for_large_softmax_param().domain_weight();
+    if(domain_num==2)
+    {
+                caffe_cpu_axpby(this->blobs_[1]->count()/domain_num, domain_weight, this->blobs_[1]->cpu_data(), Dtype(1), this->blobs_[1]->mutable_cpu_diff());
+                caffe_cpu_axpby(this->blobs_[1]->count()/domain_num, Dtype(-1)*domain_weight, this->blobs_[1]->cpu_data() + this->blobs_[1]->count()/domain_num, Dtype(1), this->blobs_[1]->mutable_cpu_diff());
+                caffe_cpu_axpby(this->blobs_[1]->count()/domain_num, domain_weight, this->blobs_[1]->cpu_data() + this->blobs_[1]->count()/domain_num, Dtype(1), this->blobs_[1]->mutable_cpu_diff() + this->blobs_[0]->count()/domain_num);
+                caffe_cpu_axpby(this->blobs_[1]->count()/domain_num, Dtype(-1)*domain_weight, this->blobs_[1]->cpu_data(), Dtype(1), this->blobs_[1]->mutable_cpu_diff() + this->blobs_[1]->count()/domain_num);
+    }
+  }
+    // Gradient with respect to bottom data
+  if (propagate_down[0]) {
+    const Dtype* bottom_data = bottom[0]->cpu_data();
+    caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, M_, K_, N_, (Dtype)1.,
+        top_diff_copy, this->blobs_[0]->cpu_data(), (Dtype)0.,
+        bottom[0]->mutable_cpu_diff());
+  
+  for (int i = 0; i < M_; i++) {
+       int label = static_cast<int>(label_[i]);
+       caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], this->blobs_[0]->cpu_data()+label*K_, bottom[0]->mutable_cpu_diff()+i*K_);
+       caffe_axpy<Dtype>(K_, alpha2*top_diff[i*N_ + label]*w_norm[label]/x_norm[i], bottom_data+i*K_, bottom[0]->mutable_cpu_diff()+i*K_);    
+   }
+  }
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(InnerProductForLargeSoftmaxLayer);
+#endif
+
+INSTANTIATE_CLASS(InnerProductForLargeSoftmaxLayer);
+REGISTER_LAYER_CLASS(InnerProductForLargeSoftmax);
+
+} 
+/*   1+cosine  for desaturation
+#include <vector>
+
+#include "caffe/filler.hpp"
+#include "caffe/layers/inner_product_for_large_softmax_layer.hpp"
+#include "caffe/util/math_functions.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  const int num_output = this->layer_param_.inner_product_for_large_softmax_param().num_output();
+  bias_term_ = this->layer_param_.inner_product_for_large_softmax_param().bias_term();
+  m_ = this->layer_param_.inner_product_for_large_softmax_param().m();
+  lamda_ = this->layer_param_.inner_product_for_large_softmax_param().lamda();
+  miu_ = this->layer_param_.inner_product_for_large_softmax_param().miu();
+  N_ = num_output;
+  const int axis = bottom[0]->CanonicalAxisIndex(
+      this->layer_param_.inner_product_for_large_softmax_param().axis());
+  // Dimensions starting from "axis" are "flattened" into a single
+  // length K_ vector. For example, if bottom[0]'s shape is (N, C, H, W),
+  // and axis == 1, N inner products with dimension CHW are performed.
+  K_ = bottom[0]->count(axis);
+  // Check if we need to set up the weights
+  if (this->blobs_.size() > 0) {
+    LOG(INFO) << "Skipping parameter initialization";
+  } else {
+    if (bias_term_) {
+      this->blobs_.resize(2);
+    } else {
+      this->blobs_.resize(1);
+    }
+    // Intialize the weight
+    vector<int> weight_shape(2);
+    weight_shape[0] = N_;
+    weight_shape[1] = K_;
+    this->blobs_[0].reset(new Blob<Dtype>(weight_shape));
+    // fill the weights
+    shared_ptr<Filler<Dtype> > weight_filler(GetFiller<Dtype>(
+        this->layer_param_.inner_product_for_large_softmax_param().weight_filler()));
+    weight_filler->Fill(this->blobs_[0].get());
+    // If necessary, intiialize and fill the bias term
+    if (bias_term_) {
+      vector<int> bias_shape(1, N_);
+      this->blobs_[1].reset(new Blob<Dtype>(bias_shape));
+      shared_ptr<Filler<Dtype> > bias_filler(GetFiller<Dtype>(
+          this->layer_param_.inner_product_for_large_softmax_param().bias_filler()));
+      bias_filler->Fill(this->blobs_[1].get());
+    }
+  }  // parameter initialization
+  this->param_propagate_down_.resize(this->blobs_.size(), true);
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  // Figure out the dimensions
+  const int axis = bottom[0]->CanonicalAxisIndex(
+      this->layer_param_.inner_product_for_large_softmax_param().axis());
+  const int new_K = bottom[0]->count(axis);
+  CHECK_EQ(K_, new_K)
+      << "Input size incompatible with inner product parameters.";
+  // The first "axis" dimensions are independent inner products; the total
+  // number of these is M_, the product over these dimensions.
+  M_ = bottom[0]->count(0, axis);
+  // The top shape will be the bottom shape with the flattened axes dropped,
+  // and replaced by a single axis with dimension num_output (N_).
+  vector<int> top_shape = bottom[0]->shape();
+  top_shape.resize(axis + 1);
+  top_shape[axis] = N_;
+  top[0]->Reshape(top_shape);
+  // Set up the bias multiplier
+  if (bias_term_) {
+    vector<int> bias_shape(1, M_);
+    bias_multiplier_.Reshape(bias_shape);
+    caffe_set(M_, Dtype(1), bias_multiplier_.mutable_cpu_data());
+  }
+    w_norm_.Reshape(N_,1,1,1);
+
+    x_norm_.Reshape(M_,1,1,1);
+    top_diff_copy_.Reshape(top_shape);
+    sqr_bottom.ReshapeLike(*bottom[0]);
+    sqr_w.Reshape(N_,K_,1,1);
+
+    kesi_.Reshape(1,1,1,1);
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+  const Dtype* bottom_data = bottom[0]->cpu_data();
+  const Dtype* label_ = bottom[1]->cpu_data();
+  Dtype* top_data = top[0]->mutable_cpu_data();
+  const Dtype* weight = this->blobs_[0]->cpu_data();
+  Dtype* w_norm = w_norm_.mutable_cpu_data();
+  Dtype* x_norm = x_norm_.mutable_cpu_data();
+  caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasTrans, M_, N_, K_, (Dtype)1.,
+      bottom_data, weight, (Dtype)0., top_data);
+  // compute ||x|| num=M_
+  for (int i = 0; i < M_; i++) {
+    x_norm[i] = caffe_cpu_dot<Dtype>(K_, bottom_data + i * K_, bottom_data + i * K_);
+    x_norm[i] = std::sqrt(x_norm[i]);
+  }
+  // compute ||w|| num=N_
+  for (int i = 0; i < N_; i++) {
+    w_norm[i] = caffe_cpu_dot<Dtype>(K_, weight + i * K_, weight + i * K_);
+    w_norm[i] = std::sqrt(w_norm[i]);
+  }
+  // update top[i]
+  Dtype* kesi = kesi_.mutable_cpu_data();
+  caffe_rng_gaussian<Dtype>(1,Dtype(0),sqrt(m_),kesi);
+  kesi[0] = std::fabs(kesi[0]) + miu_ + 1.0;
+//LOG(INFO)<<"lamda="<<lamda_<<"    m="<<m_<<"  miu="<<miu_<<"   kesi="<<kesi[0];
+  for (int i = 0; i < M_; i++) {
+    int label = static_cast<int>(label_[i]);
+    top_data[i * N_ + label] = (lamda_ + (Dtype(1.0) - lamda_ )*(Dtype(2) - kesi[0])) * top_data[ i * N_ + label] + (Dtype(1.0) - lamda_ )*(Dtype(1.0) - kesi[0]) * w_norm[label] * x_norm[i];
+  }
+  if (bias_term_) {
+    caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, M_, N_, 1, (Dtype)1.,
+        bias_multiplier_.cpu_data(),
+        this->blobs_[1]->cpu_data(), (Dtype)1., top_data);
+  }
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down,
+    const vector<Blob<Dtype>*>& bottom) {
+  const Dtype* label_ = bottom[1]->cpu_data();
+  const Dtype* top_diff = top[0]->cpu_diff();
+  const Dtype* kesi = kesi_.cpu_data();
+  Dtype alpha1 = lamda_ + (Dtype(1.0) - lamda_)*(Dtype(2) - kesi[0]);
+  Dtype alpha2 = (Dtype(1.0) - lamda_)*(Dtype(1.0) - kesi[0]);
+  const Dtype* w_norm = w_norm_.cpu_data();
+  const Dtype* x_norm = x_norm_.cpu_data();
+// copy top_diff to top_diff_copy  
+  Dtype* top_diff_copy = top_diff_copy_.mutable_cpu_data();
+  caffe_copy(top[0]->count(), top_diff, top_diff_copy);
+// modify top_diff_copy to zero
+  for (int i = 0; i < M_; i++) {
+     caffe_set(1, Dtype(0), top_diff_copy+i*N_+static_cast<int>(label_[i]));
+  }
+    // Gradient with respect to weight
+  if (this->param_propagate_down_[0]) {
+    const Dtype* bottom_data = bottom[0]->cpu_data();
+    caffe_cpu_gemm<Dtype>(CblasTrans, CblasNoTrans, N_, K_, M_, (Dtype)1.,
+        top_diff_copy, bottom_data, (Dtype)1., this->blobs_[0]->mutable_cpu_diff());
+
+    for (int i = 0; i < M_; i++) {
+       int label = static_cast<int>(label_[i]);
+       caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], bottom_data+i*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+       caffe_axpy<Dtype>(K_, alpha2*x_norm[i]*top_diff[i*N_ + label]/w_norm[label], this->blobs_[0]->cpu_data()+label*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+    }
+  }
+    // Gradient with respect to bias
+  if (bias_term_ && this->param_propagate_down_[1]) {
+    caffe_cpu_gemv<Dtype>(CblasTrans, M_, N_, (Dtype)1., top_diff,
+        bias_multiplier_.cpu_data(), (Dtype)1.,
+        this->blobs_[1]->mutable_cpu_diff());
+  }
+    // Gradient with respect to bottom data
+  if (propagate_down[0]) {
+    const Dtype* bottom_data = bottom[0]->cpu_data();
+    caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, M_, K_, N_, (Dtype)1.,
+        top_diff_copy, this->blobs_[0]->cpu_data(), (Dtype)0.,
+        bottom[0]->mutable_cpu_diff());
+  
+  for (int i = 0; i < M_; i++) {
+       int label = static_cast<int>(label_[i]);
+       caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], this->blobs_[0]->cpu_data()+label*K_, bottom[0]->mutable_cpu_diff()+i*K_);
+       caffe_axpy<Dtype>(K_, alpha2*top_diff[i*N_ + label]*w_norm[label]/x_norm[i], bottom_data+i*K_, bottom[0]->mutable_cpu_diff()+i*K_);    
+   }
+  }
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(InnerProductForLargeSoftmaxLayer);
+#endif
+
+INSTANTIATE_CLASS(InnerProductForLargeSoftmaxLayer);
+REGISTER_LAYER_CLASS(InnerProductForLargeSoftmax);
+
+}  // namespace caffe
+
+*/
+
+
+//
+/*
+//bei fen noisy softmax
+
+
+#include <vector>
+
+#include "caffe/filler.hpp"
+#include "caffe/layers/inner_product_for_large_softmax_layer.hpp"
+#include "caffe/util/math_functions.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  const int num_output = this->layer_param_.inner_product_for_large_softmax_param().num_output();
+  bias_term_ = this->layer_param_.inner_product_for_large_softmax_param().bias_term();
+  m_ = this->layer_param_.inner_product_for_large_softmax_param().m();
+  lamda_ = this->layer_param_.inner_product_for_large_softmax_param().lamda();
+  miu_ = this->layer_param_.inner_product_for_large_softmax_param().miu();
+  N_ = num_output;
+  const int axis = bottom[0]->CanonicalAxisIndex(
+      this->layer_param_.inner_product_for_large_softmax_param().axis());
+  // Dimensions starting from "axis" are "flattened" into a single
+  // length K_ vector. For example, if bottom[0]'s shape is (N, C, H, W),
+  // and axis == 1, N inner products with dimension CHW are performed.
+  K_ = bottom[0]->count(axis);
+  // Check if we need to set up the weights
+  if (this->blobs_.size() > 0) {
+    LOG(INFO) << "Skipping parameter initialization";
+  } else {
+    if (bias_term_) {
+      this->blobs_.resize(2);
+    } else {
+      this->blobs_.resize(1);
+    }
+    // Intialize the weight
+    vector<int> weight_shape(2);
+    weight_shape[0] = N_;
+    weight_shape[1] = K_;
+    this->blobs_[0].reset(new Blob<Dtype>(weight_shape));
+    // fill the weights
+    shared_ptr<Filler<Dtype> > weight_filler(GetFiller<Dtype>(
+        this->layer_param_.inner_product_for_large_softmax_param().weight_filler()));
+    weight_filler->Fill(this->blobs_[0].get());
+    // If necessary, intiialize and fill the bias term
+    if (bias_term_) {
+      vector<int> bias_shape(1, N_);
+      this->blobs_[1].reset(new Blob<Dtype>(bias_shape));
+      shared_ptr<Filler<Dtype> > bias_filler(GetFiller<Dtype>(
+          this->layer_param_.inner_product_for_large_softmax_param().bias_filler()));
+      bias_filler->Fill(this->blobs_[1].get());
+    }
+  }  // parameter initialization
+  this->param_propagate_down_.resize(this->blobs_.size(), true);
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  // Figure out the dimensions
+  const int axis = bottom[0]->CanonicalAxisIndex(
+      this->layer_param_.inner_product_for_large_softmax_param().axis());
+  const int new_K = bottom[0]->count(axis);
+  CHECK_EQ(K_, new_K)
+      << "Input size incompatible with inner product parameters.";
+  // The first "axis" dimensions are independent inner products; the total
+  // number of these is M_, the product over these dimensions.
+  M_ = bottom[0]->count(0, axis);
+  // The top shape will be the bottom shape with the flattened axes dropped,
+  // and replaced by a single axis with dimension num_output (N_).
+  vector<int> top_shape = bottom[0]->shape();
+  top_shape.resize(axis + 1);
+  top_shape[axis] = N_;
+  top[0]->Reshape(top_shape);
+  // Set up the bias multiplier
+  if (bias_term_) {
+    vector<int> bias_shape(1, M_);
+    bias_multiplier_.Reshape(bias_shape);
+    caffe_set(M_, Dtype(1), bias_multiplier_.mutable_cpu_data());
+  }
+    w_norm_.Reshape(N_,1,1,1);
+
+    x_norm_.Reshape(M_,1,1,1);
+    top_diff_copy_.Reshape(top_shape);
+    sqr_bottom.ReshapeLike(*bottom[0]);
+    sqr_w.Reshape(N_,K_,1,1);
+
+    kesi_.Reshape(1,1,1,1);
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+  const Dtype* bottom_data = bottom[0]->cpu_data();
+  const Dtype* label_ = bottom[1]->cpu_data();
+  Dtype* top_data = top[0]->mutable_cpu_data();
+  const Dtype* weight = this->blobs_[0]->cpu_data();
+  Dtype* w_norm = w_norm_.mutable_cpu_data();
+  Dtype* x_norm = x_norm_.mutable_cpu_data();
+  caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasTrans, M_, N_, K_, (Dtype)1.,
+      bottom_data, weight, (Dtype)0., top_data);
+  // compute ||x|| num=M_
+  for (int i = 0; i < M_; i++) {
+    x_norm[i] = caffe_cpu_dot<Dtype>(K_, bottom_data + i * K_, bottom_data + i * K_);
+    x_norm[i] = std::sqrt(x_norm[i]);
+  }
+  // compute ||w|| num=N_
+  for (int i = 0; i < N_; i++) {
+    w_norm[i] = caffe_cpu_dot<Dtype>(K_, weight + i * K_, weight + i * K_);
+    w_norm[i] = std::sqrt(w_norm[i]);
+  }
+  // update top[i]
+  Dtype* kesi = kesi_.mutable_cpu_data();
+  caffe_rng_gaussian<Dtype>(1,Dtype(0),sqrt(m_),kesi);
+  kesi[0] = std::fabs(kesi[0]) + miu_ + 1.0;
+//LOG(INFO)<<"lamda="<<lamda_<<"    m="<<m_<<"  miu="<<miu_<<"   kesi="<<kesi[0];
+  for (int i = 0; i < M_; i++) {
+    int label = static_cast<int>(label_[i]);
+    top_data[i * N_ + label] = (lamda_ + (Dtype(1.0) - lamda_ )* kesi[0]) * top_data[ i * N_ + label] + (Dtype(1.0) - lamda_ )*(Dtype(1.0) - kesi[0]) * w_norm[label] * x_norm[i];
+  }
+  if (bias_term_) {
+    caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, M_, N_, 1, (Dtype)1.,
+        bias_multiplier_.cpu_data(),
+        this->blobs_[1]->cpu_data(), (Dtype)1., top_data);
+  }
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down,
+    const vector<Blob<Dtype>*>& bottom) {
+  const Dtype* label_ = bottom[1]->cpu_data();
+  const Dtype* top_diff = top[0]->cpu_diff();
+  const Dtype* kesi = kesi_.cpu_data();
+  Dtype alpha1 = lamda_ + (Dtype(1.0) - lamda_)*kesi[0];
+  Dtype alpha2 = (Dtype(1.0) - lamda_)*(Dtype(1.0) - kesi[0]);
+  const Dtype* w_norm = w_norm_.cpu_data();
+  const Dtype* x_norm = x_norm_.cpu_data();
+// copy top_diff to top_diff_copy  
+  Dtype* top_diff_copy = top_diff_copy_.mutable_cpu_data();
+  caffe_copy(top[0]->count(), top_diff, top_diff_copy);
+// modify top_diff_copy to zero
+  for (int i = 0; i < M_; i++) {
+     caffe_set(1, Dtype(0), top_diff_copy+i*N_+static_cast<int>(label_[i]));
+  }
+    // Gradient with respect to weight
+  if (this->param_propagate_down_[0]) {
+    const Dtype* bottom_data = bottom[0]->cpu_data();
+    caffe_cpu_gemm<Dtype>(CblasTrans, CblasNoTrans, N_, K_, M_, (Dtype)1.,
+        top_diff_copy, bottom_data, (Dtype)1., this->blobs_[0]->mutable_cpu_diff());
+
+    for (int i = 0; i < M_; i++) {
+       int label = static_cast<int>(label_[i]);
+       caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], bottom_data+i*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+       caffe_axpy<Dtype>(K_, alpha2*x_norm[i]*top_diff[i*N_ + label]/w_norm[label], this->blobs_[0]->cpu_data()+label*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+    }
+  }
+    // Gradient with respect to bias
+  if (bias_term_ && this->param_propagate_down_[1]) {
+    caffe_cpu_gemv<Dtype>(CblasTrans, M_, N_, (Dtype)1., top_diff,
+        bias_multiplier_.cpu_data(), (Dtype)1.,
+        this->blobs_[1]->mutable_cpu_diff());
+  }
+    // Gradient with respect to bottom data
+  if (propagate_down[0]) {
+    const Dtype* bottom_data = bottom[0]->cpu_data();
+    caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, M_, K_, N_, (Dtype)1.,
+        top_diff_copy, this->blobs_[0]->cpu_data(), (Dtype)0.,
+        bottom[0]->mutable_cpu_diff());
+  
+  for (int i = 0; i < M_; i++) {
+       int label = static_cast<int>(label_[i]);
+       caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], this->blobs_[0]->cpu_data()+label*K_, bottom[0]->mutable_cpu_diff()+i*K_);
+       caffe_axpy<Dtype>(K_, alpha2*top_diff[i*N_ + label]*w_norm[label]/x_norm[i], bottom_data+i*K_, bottom[0]->mutable_cpu_diff()+i*K_);    
+   }
+  }
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(InnerProductForLargeSoftmaxLayer);
+#endif
+
+INSTANTIATE_CLASS(InnerProductForLargeSoftmaxLayer);
+REGISTER_LAYER_CLASS(InnerProductForLargeSoftmax);
+
+}  // namespace caffe
+
+*/
+//for recurrent cosine
+
+
+/*
+#include <vector>
+
+#include "caffe/filler.hpp"
+#include "caffe/layers/inner_product_for_large_softmax_layer.hpp"
+#include "caffe/util/math_functions.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  const int num_output = this->layer_param_.inner_product_for_large_softmax_param().num_output();
+  bias_term_ = this->layer_param_.inner_product_for_large_softmax_param().bias_term();
+  m_ = this->layer_param_.inner_product_for_large_softmax_param().m();
+  lamda_ = this->layer_param_.inner_product_for_large_softmax_param().lamda();
+  N_ = num_output;
+  const int axis = bottom[0]->CanonicalAxisIndex(
+      this->layer_param_.inner_product_for_large_softmax_param().axis());
+  // Dimensions starting from "axis" are "flattened" into a single
+  // length K_ vector. For example, if bottom[0]'s shape is (N, C, H, W),
+  // and axis == 1, N inner products with dimension CHW are performed.
+  K_ = bottom[0]->count(axis);
+  // Check if we need to set up the weights
+  if (this->blobs_.size() > 0) {
+    LOG(INFO) << "Skipping parameter initialization";
+  } else {
+    if (bias_term_) {
+      this->blobs_.resize(2);
+    } else {
+      this->blobs_.resize(1);
+    }
+    // Intialize the weight
+    vector<int> weight_shape(2);
+    weight_shape[0] = N_;
+    weight_shape[1] = K_;
+    this->blobs_[0].reset(new Blob<Dtype>(weight_shape));
+    // fill the weights
+    shared_ptr<Filler<Dtype> > weight_filler(GetFiller<Dtype>(
+        this->layer_param_.inner_product_for_large_softmax_param().weight_filler()));
+    weight_filler->Fill(this->blobs_[0].get());
+    // If necessary, intiialize and fill the bias term
+    if (bias_term_) {
+      vector<int> bias_shape(1, N_);
+      this->blobs_[1].reset(new Blob<Dtype>(bias_shape));
+      shared_ptr<Filler<Dtype> > bias_filler(GetFiller<Dtype>(
+          this->layer_param_.inner_product_for_large_softmax_param().bias_filler()));
+      bias_filler->Fill(this->blobs_[1].get());
+    }
+  }  // parameter initialization
+  this->param_propagate_down_.resize(this->blobs_.size(), true);
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  // Figure out the dimensions
+  const int axis = bottom[0]->CanonicalAxisIndex(
+      this->layer_param_.inner_product_for_large_softmax_param().axis());
+  const int new_K = bottom[0]->count(axis);
+  CHECK_EQ(K_, new_K)
+      << "Input size incompatible with inner product parameters.";
+  // The first "axis" dimensions are independent inner products; the total
+  // number of these is M_, the product over these dimensions.
+  M_ = bottom[0]->count(0, axis);
+  // The top shape will be the bottom shape with the flattened axes dropped,
+  // and replaced by a single axis with dimension num_output (N_).
+  vector<int> top_shape = bottom[0]->shape();
+  top_shape.resize(axis + 1);
+  top_shape[axis] = N_;
+  top[0]->Reshape(top_shape);
+  // Set up the bias multiplier
+  if (bias_term_) {
+    vector<int> bias_shape(1, M_);
+    bias_multiplier_.Reshape(bias_shape);
+    caffe_set(M_, Dtype(1), bias_multiplier_.mutable_cpu_data());
+  }
+    w_norm_.Reshape(N_,1,1,1);
+
+    x_norm_.Reshape(M_,1,1,1);
+    top_diff_copy_.Reshape(top_shape);
+    sqr_bottom.ReshapeLike(*bottom[0]);
+    sqr_w.Reshape(N_,K_,1,1);
+    top_data_copy_.Reshape(top_shape);
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+  const Dtype* bottom_data = bottom[0]->cpu_data();
+  const Dtype* label_ = bottom[1]->cpu_data();
+  Dtype* top_data = top[0]->mutable_cpu_data();
+  Dtype* top_data_copy = top_data_copy_.mutable_cpu_data();
+  const Dtype* weight = this->blobs_[0]->cpu_data();
+  Dtype* w_norm = w_norm_.mutable_cpu_data();
+  Dtype* x_norm = x_norm_.mutable_cpu_data();
+  caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasTrans, M_, N_, K_, (Dtype)1.,
+      bottom_data, weight, (Dtype)0., top_data);
+  caffe_copy(top[0]->count(), top_data, top_data_copy);
+  // compute ||x|| num=M_
+  for (int i = 0; i < M_; i++) {
+    x_norm[i] = caffe_cpu_dot<Dtype>(K_, bottom_data + i * K_, bottom_data + i * K_);
+    x_norm[i] = std::sqrt(x_norm[i]);
+//for(int j=0;j<N_;j++){
+//LOG(INFO)<<"F i="<<i<<" top_data["<<j<<"]="<<top_data[i*N_+j]<<std::endl;
+//}
+  }
+  // compute ||w|| num=N_
+  for (int i = 0; i < N_; i++) {
+    w_norm[i] = caffe_cpu_dot<Dtype>(K_, weight + i * K_, weight + i * K_);
+    w_norm[i] = std::sqrt(w_norm[i]);
+  }
+  // update top[i]
+  for (int i = 0; i < M_; i++) {
+    int label = static_cast<int>(label_[i]);
+    int k = top_data[i * N_ + label] < 0 ? 1 : 0;
+    top_data[i * N_ + label] = lamda_ * top_data[i * N_ + label] + (1 - lamda_) * (Dtype(pow(-1, k)) * 2 * Dtype(pow(top_data[i * N_ + label], 2)) / w_norm[label] / x_norm[i] - (2 * k + pow(-1, k)) * w_norm[label] * x_norm[i]);
+
+//for(int j=0;j<N_;j++){
+//LOG(INFO)<<"F i="<<i<<" top_data["<<j<<"]="<<top_data[i*N_+j]<<"  label="<<label<<std::endl;
+//}
+  }
+  if (bias_term_) {
+    caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, M_, N_, 1, (Dtype)1.,
+        bias_multiplier_.cpu_data(),
+        this->blobs_[1]->cpu_data(), (Dtype)1., top_data);
+  }
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down,
+    const vector<Blob<Dtype>*>& bottom) {
+  const Dtype* label_ = bottom[1]->cpu_data();
+  const Dtype* top_diff = top[0]->cpu_diff();
+  const Dtype* w_norm = w_norm_.cpu_data();
+  const Dtype* x_norm = x_norm_.cpu_data();
+  const Dtype* top_data_copy = top_data_copy_.cpu_data();
+// copy top_diff to top_diff_copy
+  Dtype* top_diff_copy = top_diff_copy_.mutable_cpu_data();
+  caffe_copy(top[0]->count(), top_diff, top_diff_copy);
+// modify top_diff_copy to zero
+  for (int i = 0; i < M_; i++) {
+     caffe_set(1, Dtype(0), top_diff_copy+i*N_+static_cast<int>(label_[i]));
+//for(int j=0;j<N_;j++)
+//LOG(INFO)<<"B i="<<i<<" top_diff["<<j<<"]="<<top_diff[i*N_+j]<<" label="<<static_cast<int>(label_[i])<<std::endl;
+  }
+    // Gradient with respect to weight
+  if (this->param_propagate_down_[0]) {
+    const Dtype* bottom_data = bottom[0]->cpu_data();
+    caffe_cpu_gemm<Dtype>(CblasTrans, CblasNoTrans, N_, K_, M_, (Dtype)1.,
+        top_diff_copy, bottom_data, (Dtype)1., this->blobs_[0]->mutable_cpu_diff());
+    for (int i = 0; i < M_; i++) {
+       int label = static_cast<int>(label_[i]);
+       int k = top_data_copy[i * N_ + label] < 0 ? 1 : 0;
+       Dtype alpha1,alpha2;
+       alpha1 = (Dtype(pow(-1, k)) * 4 * top_data_copy[i * N_ + label] / x_norm[i] /w_norm[label])*(1-lamda_)+lamda_;
+       alpha2 = (lamda_-1)*(Dtype(pow(-1, k)) * 2 * top_data_copy[i * N_ + label] * top_data_copy[i * N_ + label] / x_norm[i] / Dtype(pow(w_norm[label], 3)) + (2 * k + Dtype(pow(-1, k))) * x_norm[i] / w_norm[label]);
+       caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], bottom_data+i*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+       caffe_axpy<Dtype>(K_, alpha2*top_diff[i*N_ + label], this->blobs_[0]->cpu_data()+label*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+    }
+  }
+    // Gradient with respect to bias
+  if (bias_term_ && this->param_propagate_down_[1]) {
+    caffe_cpu_gemv<Dtype>(CblasTrans, M_, N_, (Dtype)1., top_diff,
+        bias_multiplier_.cpu_data(), (Dtype)1.,
+        this->blobs_[1]->mutable_cpu_diff());
+  }
+    // Gradient with respect to bottom data
+  if (propagate_down[0]) {
+    const Dtype* bottom_data = bottom[0]->cpu_data();
+    caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, M_, K_, N_, (Dtype)1.,
+        top_diff_copy, this->blobs_[0]->cpu_data(), (Dtype)0.,
+        bottom[0]->mutable_cpu_diff());
+  
+  for (int i = 0; i < M_; i++) {
+       int label = static_cast<int>(label_[i]);
+       int k = top_data_copy[i * N_ + label] < 0 ? 1 : 0;
+       Dtype alpha1,alpha2;
+       alpha1 = (1 - lamda_)*(Dtype(pow(-1, k)) * 4 * top_data_copy[i * N_ + label] / w_norm[label] / x_norm[i]) + lamda_;
+       alpha2 = (lamda_ - 1)*(Dtype(pow(-1, k)) * 2 * top_data_copy[i * N_ + label] * top_data_copy[i * N_ + label] / w_norm[label] / Dtype(pow(x_norm[i], 3)) + (2 * k + Dtype(pow(-1, k))) * w_norm[label] / x_norm[i]);
+       caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], this->blobs_[0]->cpu_data()+label*K_, bottom[0]->mutable_cpu_diff()+i*K_);
+       caffe_axpy<Dtype>(K_, alpha2*top_diff[i*N_ + label], bottom_data+i*K_, bottom[0]->mutable_cpu_diff()+i*K_);    
+   }
+  }
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(InnerProductForLargeSoftmaxLayer);
+#endif
+
+INSTANTIATE_CLASS(InnerProductForLargeSoftmaxLayer);
+REGISTER_LAYER_CLASS(InnerProductForLargeSoftmax);
+
+}  // namespace caffe
+
+
+*/
+/*
+
+
+// for lamda*(1-cos)
+#include <vector>
+
+#include "caffe/blob.hpp"
+#include "caffe/common.hpp"
+#include "caffe/filler.hpp"
+#include "caffe/layer.hpp"
+#include "caffe/util/math_functions.hpp"
+#include "caffe/vision_layers.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  const int num_output = this->layer_param_.inner_product_for_large_softmax_param().num_output();
+  bias_term_ = this->layer_param_.inner_product_for_large_softmax_param().bias_term();
+  m_ = this->layer_param_.inner_product_for_large_softmax_param().m();
+  lamda_ = this->layer_param_.inner_product_for_large_softmax_param().lamda();
+  N_ = num_output;
+  const int axis = bottom[0]->CanonicalAxisIndex(
+      this->layer_param_.inner_product_for_large_softmax_param().axis());
+  // Dimensions starting from "axis" are "flattened" into a single
+  // length K_ vector. For example, if bottom[0]'s shape is (N, C, H, W),
+  // and axis == 1, N inner products with dimension CHW are performed.
+  K_ = bottom[0]->count(axis);
+  // Check if we need to set up the weights
+  if (this->blobs_.size() > 0) {
+    LOG(INFO) << "Skipping parameter initialization";
+  } else {
+    if (bias_term_) {
+      this->blobs_.resize(2);
+    } else {
+      this->blobs_.resize(1);
+    }
+    // Intialize the weight
+    vector<int> weight_shape(2);
+    weight_shape[0] = N_;
+    weight_shape[1] = K_;
+    this->blobs_[0].reset(new Blob<Dtype>(weight_shape));
+    // fill the weights
+    shared_ptr<Filler<Dtype> > weight_filler(GetFiller<Dtype>(
+        this->layer_param_.inner_product_for_large_softmax_param().weight_filler()));
+    weight_filler->Fill(this->blobs_[0].get());
+    // If necessary, intiialize and fill the bias term
+    if (bias_term_) {
+      vector<int> bias_shape(1, N_);
+      this->blobs_[1].reset(new Blob<Dtype>(bias_shape));
+      shared_ptr<Filler<Dtype> > bias_filler(GetFiller<Dtype>(
+          this->layer_param_.inner_product_for_large_softmax_param().bias_filler()));
+      bias_filler->Fill(this->blobs_[1].get());
+    }
+  }  // parameter initialization
+  this->param_propagate_down_.resize(this->blobs_.size(), true);
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  // Figure out the dimensions
+  const int axis = bottom[0]->CanonicalAxisIndex(
+      this->layer_param_.inner_product_for_large_softmax_param().axis());
+  const int new_K = bottom[0]->count(axis);
+  CHECK_EQ(K_, new_K)
+      << "Input size incompatible with inner product parameters.";
+  // The first "axis" dimensions are independent inner products; the total
+  // number of these is M_, the product over these dimensions.
+  M_ = bottom[0]->count(0, axis);
+  // The top shape will be the bottom shape with the flattened axes dropped,
+  // and replaced by a single axis with dimension num_output (N_).
+  vector<int> top_shape = bottom[0]->shape();
+  top_shape.resize(axis + 1);
+  top_shape[axis] = N_;
+  top[0]->Reshape(top_shape);
+  // Set up the bias multiplier
+  if (bias_term_) {
+    vector<int> bias_shape(1, M_);
+    bias_multiplier_.Reshape(bias_shape);
+    caffe_set(M_, Dtype(1), bias_multiplier_.mutable_cpu_data());
+  }
+    w_norm_.Reshape(N_,1,1,1);
+
+    x_norm_.Reshape(M_,1,1,1);
+    top_diff_copy_.Reshape(top_shape);
+    sqr_bottom.ReshapeLike(*bottom[0]);
+    sqr_w.Reshape(N_,K_,1,1);
+    top_data_copy_.Reshape(top_shape);
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+  const Dtype* bottom_data = bottom[0]->cpu_data();
+  const Dtype* label_ = bottom[1]->cpu_data();
+  Dtype* top_data = top[0]->mutable_cpu_data();
+  Dtype* top_data_copy = top_data_copy_.mutable_cpu_data();
+  const Dtype* weight = this->blobs_[0]->cpu_data();
+  Dtype* w_norm = w_norm_.mutable_cpu_data();
+  Dtype* x_norm = x_norm_.mutable_cpu_data();
+  caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasTrans, M_, N_, K_, (Dtype)1.,
+      bottom_data, weight, (Dtype)0., top_data);
+  caffe_copy(top[0]->count(), top_data, top_data_copy);
+  // compute ||x|| num=M_
+  for (int i = 0; i < M_; i++) {
+    x_norm[i] = caffe_cpu_dot<Dtype>(K_, bottom_data + i * K_, bottom_data + i * K_);
+    x_norm[i] = std::sqrt(x_norm[i]);
+  }
+  // compute ||w|| num=N_
+  for (int i = 0; i < N_; i++) {
+    w_norm[i] = caffe_cpu_dot<Dtype>(K_, weight + i * K_, weight + i * K_);
+    w_norm[i] = std::sqrt(w_norm[i]);
+  }
+  // update top[i]
+
+  if (bias_term_) {
+    caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, M_, N_, 1, (Dtype)1.,
+        bias_multiplier_.cpu_data(),
+        this->blobs_[1]->cpu_data(), (Dtype)1., top_data);
+  }
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down,
+    const vector<Blob<Dtype>*>& bottom) {
+  const Dtype* label_ = bottom[1]->cpu_data();
+  const Dtype* top_diff = top[0]->cpu_diff();
+  const Dtype* w_norm = w_norm_.cpu_data();
+  const Dtype* x_norm = x_norm_.cpu_data();
+  const Dtype* top_data_copy = top_data_copy_.cpu_data();
+// copy top_diff to top_diff_copy
+  Dtype* top_diff_copy = top_diff_copy_.mutable_cpu_data();
+  caffe_copy(top[0]->count(), top_diff, top_diff_copy);
+// modify top_diff_copy to zero
+  for (int i = 0; i < M_; i++) {
+     caffe_set(1, Dtype(0), top_diff_copy+i*N_+static_cast<int>(label_[i]));
+//for(int j=0;j<N_;j++)
+//LOG(INFO)<<"B i="<<i<<" top_diff["<<j<<"]="<<top_diff[i*N_+j]<<" label="<<static_cast<int>(label_[i])<<std::endl;
+  }
+    // Gradient with respect to weight
+  if (this->param_propagate_down_[0]) {
+    const Dtype* bottom_data = bottom[0]->cpu_data();
+    caffe_cpu_gemm<Dtype>(CblasTrans, CblasNoTrans, N_, K_, M_, (Dtype)1.,
+        top_diff, bottom_data, (Dtype)1., this->blobs_[0]->mutable_cpu_diff());
+    for (int i = 0; i < M_; i++) {
+       int label = static_cast<int>(label_[i]);
+       int k = top_data_copy[i * N_ + label] < 0 ? 1 : 0;
+       Dtype alpha1,alpha2;
+       //alpha1 = 4*(Dtype(pow(-1,k+1)))*lamda_*top_data_copy[i*N_+label]/(pow(x_norm[i],2)*pow(w_norm[label],2));
+       //alpha2 = 4*(Dtype(pow(-1,k)))*lamda_*top_data_copy[i*N_+label]*top_data_copy[i*N_+label]/(pow(x_norm[i],2)*pow(w_norm[label],4));
+       alpha1 = -1 * lamda_ / x_norm[i] /w_norm[label];
+       alpha2 = lamda_ * top_data_copy[i * N_ + label] / x_norm[i] / Dtype(pow(w_norm[label], 3));
+       caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], bottom_data+i*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+       caffe_axpy<Dtype>(K_, alpha2*top_diff[i*N_ + label], this->blobs_[0]->cpu_data()+label*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+    }
+  }
+    // Gradient with respect to bias
+  if (bias_term_ && this->param_propagate_down_[1]) {
+    caffe_cpu_gemv<Dtype>(CblasTrans, M_, N_, (Dtype)1., top_diff,
+        bias_multiplier_.cpu_data(), (Dtype)1.,
+        this->blobs_[1]->mutable_cpu_diff());
+  }
+    // Gradient with respect to bottom data
+  if (propagate_down[0]) {
+    const Dtype* bottom_data = bottom[0]->cpu_data();
+    caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, M_, K_, N_, (Dtype)1.,
+        top_diff, this->blobs_[0]->cpu_data(), (Dtype)0.,
+        bottom[0]->mutable_cpu_diff());
+  
+  for (int i = 0; i < M_; i++) {
+       int label = static_cast<int>(label_[i]);
+       int k = top_data_copy[i * N_ + label] < 0 ? 1 : 0;
+       Dtype alpha1,alpha2;
+       //alpha1 = 4*(Dtype(pow(-1,k+1)))*lamda_*top_data_copy[i*N_+label]/(pow(x_norm[i],2)*pow(w_norm[label],2));
+       //alpha2 = 4*(Dtype(pow(-1,k)))*lamda_*top_data_copy[i*N_+label]*top_data_copy[i*N_+label]/(pow(x_norm[i],4)*pow(w_norm[label],2));
+       alpha1 = (-1)*lamda_ / x_norm[i] /w_norm[label];
+       alpha2 = lamda_ * top_data_copy[i * N_ + label] / w_norm[label] / Dtype(pow(x_norm[i], 3));
+       caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], this->blobs_[0]->cpu_data()+label*K_, bottom[0]->mutable_cpu_diff()+i*K_);
+       caffe_axpy<Dtype>(K_, alpha2*top_diff[i*N_ + label], bottom_data+i*K_, bottom[0]->mutable_cpu_diff()+i*K_);    
+   }
+  }
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(InnerProductForLargeSoftmaxLayer);
+#endif
+
+INSTANTIATE_CLASS(InnerProductForLargeSoftmaxLayer);
+REGISTER_LAYER_CLASS(InnerProductForLargeSoftmax);
+
+}
+
+*/
+/*
+
+// noise disturbe
+#include <vector>
+#include <cfloat>
+#include <algorithm>
+
+#include "caffe/blob.hpp"
+#include "caffe/common.hpp"
+#include "caffe/filler.hpp"
+#include "caffe/layer.hpp"
+#include "caffe/util/math_functions.hpp"
+#include "caffe/vision_layers.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  const int num_output = this->layer_param_.inner_product_for_large_softmax_param().num_output();
+  bias_term_ = this->layer_param_.inner_product_for_large_softmax_param().bias_term();
+  m_ = this->layer_param_.inner_product_for_large_softmax_param().m();
+  lamda_ = this->layer_param_.inner_product_for_large_softmax_param().lamda();
+  miu_ = this->layer_param_.inner_product_for_large_softmax_param().miu();
+  N_ = num_output;
+  const int axis = bottom[0]->CanonicalAxisIndex(
+      this->layer_param_.inner_product_for_large_softmax_param().axis());
+  // Dimensions starting from "axis" are "flattened" into a single
+  // length K_ vector. For example, if bottom[0]'s shape is (N, C, H, W),
+  // and axis == 1, N inner products with dimension CHW are performed.
+  K_ = bottom[0]->count(axis);
+  // Check if we need to set up the weights
+  if (this->blobs_.size() > 0) {
+    LOG(INFO) << "Skipping parameter initialization";
+  } else {
+    if (bias_term_) {
+      this->blobs_.resize(2);
+    } else {
+      this->blobs_.resize(1);
+    }
+    // Intialize the weight
+    vector<int> weight_shape(2);
+    weight_shape[0] = N_;
+    weight_shape[1] = K_;
+    this->blobs_[0].reset(new Blob<Dtype>(weight_shape));
+    // fill the weights
+    shared_ptr<Filler<Dtype> > weight_filler(GetFiller<Dtype>(
+        this->layer_param_.inner_product_for_large_softmax_param().weight_filler()));
+    weight_filler->Fill(this->blobs_[0].get());
+    // If necessary, intiialize and fill the bias term
+    if (bias_term_) {
+      vector<int> bias_shape(1, N_);
+      this->blobs_[1].reset(new Blob<Dtype>(bias_shape));
+      shared_ptr<Filler<Dtype> > bias_filler(GetFiller<Dtype>(
+          this->layer_param_.inner_product_for_large_softmax_param().bias_filler()));
+      bias_filler->Fill(this->blobs_[1].get());
+    }
+  }  // parameter initialization
+  this->param_propagate_down_.resize(this->blobs_.size(), true);
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  // Figure out the dimensions
+  const int axis = bottom[0]->CanonicalAxisIndex(
+      this->layer_param_.inner_product_for_large_softmax_param().axis());
+  const int new_K = bottom[0]->count(axis);
+  CHECK_EQ(K_, new_K)
+      << "Input size incompatible with inner product parameters.";
+  // The first "axis" dimensions are independent inner products; the total
+  // number of these is M_, the product over these dimensions.
+  M_ = bottom[0]->count(0, axis);
+  // The top shape will be the bottom shape with the flattened axes dropped,
+  // and replaced by a single axis with dimension num_output (N_).
+  vector<int> top_shape = bottom[0]->shape();
+  top_shape.resize(axis + 1);
+  top_shape[axis] = N_;
+  top[0]->Reshape(top_shape);
+  // Set up the bias multiplier
+  if (bias_term_) {
+    vector<int> bias_shape(1, M_);
+    bias_multiplier_.Reshape(bias_shape);
+    caffe_set(M_, Dtype(1), bias_multiplier_.mutable_cpu_data());
+  }
+    w_norm_.Reshape(N_,1,1,1);
+
+    x_norm_.Reshape(M_,1,1,1);
+    top_diff_copy_.Reshape(top_shape);
+    sqr_bottom.ReshapeLike(*bottom[0]);
+    sqr_w.Reshape(N_,K_,1,1);
+    top_data_copy_.Reshape(top_shape);
+    kesi_.Reshape(1,1,1,1);
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+  const Dtype* bottom_data = bottom[0]->cpu_data();
+  const Dtype* label_ = bottom[1]->cpu_data();
+  Dtype* top_data = top[0]->mutable_cpu_data();
+  Dtype* top_data_copy = top_data_copy_.mutable_cpu_data();
+  const Dtype* weight = this->blobs_[0]->cpu_data();
+  Dtype* w_norm = w_norm_.mutable_cpu_data();
+  Dtype* x_norm = x_norm_.mutable_cpu_data();
+  caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasTrans, M_, N_, K_, (Dtype)1.,
+      bottom_data, weight, (Dtype)0., top_data);
+  caffe_copy(top[0]->count(), top_data, top_data_copy);
+  // compute ||x|| num=M_
+  for (int i = 0; i < M_; i++) {
+    x_norm[i] = caffe_cpu_dot<Dtype>(K_, bottom_data + i * K_, bottom_data + i * K_);
+    x_norm[i] = std::sqrt(x_norm[i]);
+  }
+  // compute ||w|| num=N_
+  for (int i = 0; i < N_; i++) {
+    w_norm[i] = caffe_cpu_dot<Dtype>(K_, weight + i * K_, weight + i * K_);
+    w_norm[i] = std::sqrt(w_norm[i]);
+  }
+  // update top[i]
+  Dtype* kesi = kesi_.mutable_cpu_data();
+  caffe_rng_gaussian<Dtype>(1,Dtype(0),sqrt(m_),kesi);
+  kesi[0] = std::fabs(kesi[0]) + miu_;
+  for (int i = 0; i < M_; i++) {
+    int label = static_cast<int>(label_[i]);
+    Dtype k = top_data[i * N_ + label] < Dtype(0) ? Dtype(1.0) : Dtype(std::sqrt(std::max(Dtype(1.0) - Dtype(pow(Dtype(top_data[i * N_ + label] / w_norm[label] / x_norm[i]),2)),Dtype(FLT_MIN))));
+    top_data[i * N_ + label] = top_data[i * N_ + label] - (Dtype(1.0) - lamda_) * w_norm[label] * x_norm[i] * k * kesi[0];
+  }
+  if (bias_term_) {
+    caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, M_, N_, 1, (Dtype)1.,
+        bias_multiplier_.cpu_data(),
+        this->blobs_[1]->cpu_data(), (Dtype)1., top_data);
+  }
+}
+
+template <typename Dtype>
+void InnerProductForLargeSoftmaxLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down,
+    const vector<Blob<Dtype>*>& bottom) {
+  const Dtype* label_ = bottom[1]->cpu_data();
+  const Dtype* top_diff = top[0]->cpu_diff();
+  const Dtype* w_norm = w_norm_.cpu_data();
+  const Dtype* x_norm = x_norm_.cpu_data();
+  const Dtype* top_data_copy = top_data_copy_.cpu_data();
+  const Dtype* kesi = kesi_.cpu_data();
+// copy top_diff to top_diff_copy
+  Dtype* top_diff_copy = top_diff_copy_.mutable_cpu_data();
+  caffe_copy(top[0]->count(), top_diff, top_diff_copy);
+// modify top_diff_copy to zero
+  for (int i = 0; i < M_; i++) {
+     caffe_set(1, Dtype(0), top_diff_copy+i*N_+static_cast<int>(label_[i]));
+  }
+    // Gradient with respect to weight
+  if (this->param_propagate_down_[0]) {
+    const Dtype* bottom_data = bottom[0]->cpu_data();
+    caffe_cpu_gemm<Dtype>(CblasTrans, CblasNoTrans, N_, K_, M_, (Dtype)1.,
+        top_diff_copy, bottom_data, (Dtype)1., this->blobs_[0]->mutable_cpu_diff());
+    for (int i = 0; i < M_; i++) {
+       int label = static_cast<int>(label_[i]);
+       Dtype k = top_data_copy[i * N_ + label] < Dtype(0.0) ? Dtype(1.0) : sqrt(std::max(Dtype(1.0) - Dtype(pow(top_data_copy[i * N_ + label] / w_norm[label] / x_norm[i],2)),Dtype(FLT_MIN)));
+       if(top_data_copy[i * N_ + label] >= 0) {
+       	Dtype alpha1,alpha2;
+        Dtype si = sqrt(std::max(Dtype(pow(w_norm[label], 2) * pow(x_norm[i], 2) - pow(top_data_copy[i * N_ + label], 2)),Dtype(FLT_MIN)));
+       	alpha1 = Dtype(1.0) + (1 - lamda_) * kesi[0] * (top_data_copy[i * N_ + label] / si);
+       	alpha2 = (lamda_ - 1) * kesi[0] * (x_norm[i] / w_norm[label] * k + pow(x_norm[i],2) / si - si / pow(w_norm[label],2));
+       	caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], bottom_data+i*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+       	caffe_axpy<Dtype>(K_, alpha2*top_diff[i*N_ + label], this->blobs_[0]->cpu_data()+label*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+
+
+       } else {
+        Dtype alpha1,alpha2;
+       	alpha1 = Dtype(1.0);
+       	alpha2 = (lamda_ - 1) * kesi[0] * x_norm[i] / w_norm[label];
+       	caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], bottom_data+i*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+       	caffe_axpy<Dtype>(K_, alpha2*top_diff[i*N_ + label], this->blobs_[0]->cpu_data()+label*K_, this->blobs_[0]->mutable_cpu_diff()+label*K_);
+
+       }
+    }
+  }
+    // Gradient with respect to bias
+  if (bias_term_ && this->param_propagate_down_[1]) {
+    caffe_cpu_gemv<Dtype>(CblasTrans, M_, N_, (Dtype)1., top_diff,
+        bias_multiplier_.cpu_data(), (Dtype)1.,
+        this->blobs_[1]->mutable_cpu_diff());
+  }
+    // Gradient with respect to bottom data
+  if (propagate_down[0]) {
+    const Dtype* bottom_data = bottom[0]->cpu_data();
+    caffe_cpu_gemm<Dtype>(CblasNoTrans, CblasNoTrans, M_, K_, N_, (Dtype)1.,
+        top_diff_copy, this->blobs_[0]->cpu_data(), (Dtype)0.,
+        bottom[0]->mutable_cpu_diff());
+  
+  for (int i = 0; i < M_; i++) {
+       int label = static_cast<int>(label_[i]);
+       Dtype k = top_data_copy[i * N_ + label] < Dtype(0.0) ? Dtype(1.0) : sqrt(std::max(Dtype(1.0) - Dtype(pow(top_data_copy[i * N_ + label]/ w_norm[label] / x_norm[i],2)),Dtype(FLT_MIN)));
+       if(top_data_copy[i * N_ + label] >= 0) {
+       	Dtype alpha1,alpha2;
+        Dtype si = sqrt(std::max(Dtype(pow(w_norm[label], 2) * pow(x_norm[i], 2) - pow(top_data_copy[i * N_ + label], 2)),Dtype(FLT_MIN)));
+       	alpha1 = Dtype(1.0) + (1 - lamda_) * kesi[0] * (top_data_copy[i * N_ + label] / si);
+       	alpha2 = (lamda_ - 1) * kesi[0] * (w_norm[label] / x_norm[i] * k + pow(w_norm[label],2) / si - si / pow(x_norm[i],2));
+       	caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], this->blobs_[0]->cpu_data()+label*K_, bottom[0]->mutable_cpu_diff()+i*K_);
+       	caffe_axpy<Dtype>(K_, alpha2*top_diff[i*N_ + label], bottom_data+i*K_, bottom[0]->mutable_cpu_diff()+i*K_); 
+       } else {
+        Dtype alpha1,alpha2;
+       	alpha1 = Dtype(1.0);
+       	alpha2 = (lamda_ - 1) * kesi[0] * w_norm[label] / x_norm[i];
+       	caffe_axpy<Dtype>(K_, alpha1*top_diff[i*N_ + label], this->blobs_[0]->cpu_data()+label*K_, bottom[0]->mutable_cpu_diff()+i*K_);
+       	caffe_axpy<Dtype>(K_, alpha2*top_diff[i*N_ + label], bottom_data+i*K_, bottom[0]->mutable_cpu_diff()+i*K_);    
+
+       }
+   }
+  }
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(InnerProductForLargeSoftmaxLayer);
+#endif
+
+INSTANTIATE_CLASS(InnerProductForLargeSoftmaxLayer);
+REGISTER_LAYER_CLASS(InnerProductForLargeSoftmax);
+}
+*/

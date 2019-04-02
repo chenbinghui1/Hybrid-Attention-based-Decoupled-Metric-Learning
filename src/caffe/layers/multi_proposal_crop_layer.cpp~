@@ -1,0 +1,277 @@
+//利用多个pool层的信息 产生一个crop, bottom0是RGB image, 后面是feature map
+#include <vector>
+#include <opencv2/core/core.hpp>
+#include "caffe/layers/multi_proposal_crop_layer.hpp"
+#include "caffe/util/math_functions.hpp"
+#include "opencv2/opencv.hpp"
+#include "caffe/layer.hpp"
+#include <cmath>
+#include <time.h>
+
+namespace caffe {
+
+template<typename Dtype>
+void MultiProposalCropLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+        const vector<Blob<Dtype>*>& top) {
+}
+
+template<typename Dtype>
+void MultiProposalCropLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+        const vector<Blob<Dtype>*>& top) {
+        CHECK_EQ(bottom[0]->shape(1),3)<<"The Input Images Are Not RGB Images";
+        int out_size = this->layer_param_.multi_proposal_crop_param().out_size();
+    vector<int> top_shape = bottom[0]->shape();
+	top_shape[2] = out_size;
+	top_shape[3] = out_size;
+    top[0]->Reshape(top_shape);
+    int layer_num = bottom.size()-1;
+    for(int i = 1; i <= layer_num; i++){
+        M_.push_back(vector<Dtype>(bottom[i]->shape(3)*bottom[i]->shape(3),Dtype(0.)));
+        D_.push_back(vector<Dtype>(bottom[i]->shape(3)*bottom[i]->shape(3)*bottom[i]->shape(3)*bottom[i]->shape(3),Dtype(0)));
+        tmp_.push_back(vector<Dtype>(bottom[i]->shape(3)*bottom[i]->shape(3),Dtype(0.)));
+        tmp_M_.push_back(vector<Dtype>(bottom[i]->shape(3)*bottom[i]->shape(3),Dtype(0)));
+    }
+}
+
+template<typename Dtype>
+void MultiProposalCropLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+        const vector<Blob<Dtype>*>& top) {
+        
+        
+        const Dtype mean_value1 = this->layer_param_.multi_proposal_crop_param().mean_value1();
+	const Dtype mean_value2 = this->layer_param_.multi_proposal_crop_param().mean_value2();
+	const Dtype mean_value3 = this->layer_param_.multi_proposal_crop_param().mean_value3();
+	Dtype mean_value[3] = { mean_value1, mean_value2, mean_value3 };
+	const int layer_num = bottom.size()-1;
+	const int in_size = bottom[0]->shape(3);
+	const int out_size = this->layer_param_.multi_proposal_crop_param().out_size();
+	Dtype* top_data_cpu = top[0]->mutable_cpu_data();
+	const Dtype* bottom_data_0 = bottom[0]->cpu_data();// original image data
+
+	
+	int bottom_index;
+	//convert blob to cv::mat
+	for (int n = 0; n<bottom[0]->shape(0); n++)
+	{
+	  cv::Mat cv_img = cv::Mat(bottom[0]->shape(2), bottom[0]->shape(2), CV_8UC3);//original image data to Mat
+	  cv::Mat out_cv_img = cv::Mat(out_size, out_size, CV_8UC3);
+	  //convert original image to cv::mat
+	  for (int i = 0; i < bottom[0]->shape(2); i++)//h
+		{
+			uchar* ptr = cv_img.ptr<uchar>(i);
+			int img_index = 0;
+			for (int j = 0; j < bottom[0]->shape(2); j++)//w
+			{
+				for (int k = 0; k < 3; k++)//c
+				{
+					bottom_index = n * bottom[0]->count(1) + (k * bottom[0]->shape(2) + i) * bottom[0]->shape(2) + j;
+					ptr[img_index++] = bottom_data_0[bottom_index] + mean_value[k];
+				}
+			}
+	  }
+	  //initialize proposal map
+	  caffe_set(bottom[1]->shape(3)*bottom[1]->shape(3), Dtype(1.0/Dtype(bottom[1]->shape(3))/Dtype(bottom[1]->shape(3))), &M_[0][0]);
+	  //layer to layer 
+	  for(int layer = 0; layer < layer_num; layer++){
+		const int N = bottom[layer+1]->shape(3);
+	        const int channels = bottom[layer+1]->channels();
+	        const Dtype ems = Dtype(0.15*N);
+
+	        
+	        const Dtype* features = bottom[layer+1]->cpu_data();// feature maps
+	        Dtype* tmp = &tmp_[layer][0];
+	        Dtype* M = &M_[layer][0];
+	        Dtype* tmp_M = &tmp_M_[layer][0];
+	        Dtype* D = &D_[layer][0];
+		
+		//compute transforming matrix
+		//caffe_set(N*N, Dtype(1.0/N/N), M);
+		//update current M from the former layer's M
+		if(layer > 0){
+		        //convert the former M to cv::Mat
+		        cv::Mat img_M = cv::Mat(bottom[layer]->shape(3), bottom[layer]->shape(3), CV_8UC1);
+		        for (int i = 0; i < bottom[layer]->shape(3); i++)//h
+		        {
+			        uchar* ptr = img_M.ptr<uchar>(i);
+			        int img_index = 0;
+			        for (int j = 0; j < bottom[layer]->shape(3); j++)//w
+			        {
+					ptr[img_index++] = 255*M_[layer-1][i*bottom[layer]->shape(3)+j];//norm M to [0-255]
+					
+			        }
+		        }
+		        cv::Mat resize_img_M = cv::Mat(N, N, CV_8UC1);
+		        //resize the former M to current size
+		        cv::resize(img_M, resize_img_M, resize_img_M.size(), 0, 0, cv::INTER_LINEAR);
+		        //convert CV::Mat to M
+		        int top_index;
+		        for (int i = 0; i < N; i++)//h
+		        {
+			        const uchar* ptr = resize_img_M.ptr<uchar>(i);
+			        int img_index = 0;
+			        for (int j = 0; j < N; j++)//w
+			        {
+					Dtype pixel = static_cast<Dtype>(ptr[img_index++]);
+					top_index = i * N + j;
+					M[top_index] = pixel / Dtype(255);
+			        }
+		        }
+		}
+		for(int j=0; j<N*N; j++)
+		{
+		        for(int k=j; k<N*N; k++)
+		        {
+		                Dtype ans = 0;
+		                for(int i=0; i<channels; i++)
+		                {
+		                        ans+=(features[n*N*N*channels + i*N*N +j]-features[n*N*N*channels + i*N*N + k])*(features[n*N*N*channels + i*N*N +j]-features[n*N*N*channels + i*N*N + k]);
+		                }
+		                ans = ans==0 ? 0 : std::sqrt(ans);
+		                D[j*N*N+k] = Dtype(ans * std::exp(-((std::floor(j/N)-std::floor(k/N))*(std::floor(j/N)-std::floor(k/N)) + (j%N-k%N)*(j%N-k%N))/(Dtype(2)*ems*ems)));
+		                D[k*N*N+j] = D[j*N*N+k];
+		        }
+		}
+		caffe_set(N*N, Dtype(0), tmp);
+		for(int k=0; k<N*N; k++)
+		{
+		        for(int j=0; j<N*N; j++)
+		        {
+		                tmp[k]+=D[j*N*N+k];
+		               
+		        }
+		      
+		}
+		for(int k=0; k<N*N; k++)
+		{
+		        for(int j=0; j<N*N; j++)
+		        {
+		                D[j*N*N+k]/=tmp[k];
+		        }
+		}
+		//compute stable M
+		for(int i=0; i<10; i++)
+		{
+		        caffe_cpu_gemm(CblasNoTrans, CblasNoTrans, N*N, 1, N*N, Dtype(1), D, M, Dtype(0), tmp_M);
+		        caffe_copy(N*N, tmp_M, M);
+		}
+		//scale M
+		Dtype max_M=0,min_M=100000;
+		for (int i=0; i<N*N; i++)
+		{
+		        max_M = max_M > M[i] ? max_M : M[i];
+		        min_M = min_M < M[i] ? min_M : M[i];
+		}
+		for (int i = 0; i<N*N; i++)
+		{
+		        M[i] = (M[i] - min_M)/(max_M - min_M);//scale M to [0-1]
+		}
+
+	  }
+		const int N = bottom[layer_num]->shape(3);
+		Dtype* M = &M_[layer_num-1][0];
+		//convert M to cv::Mat
+		cv::Mat img_M = cv::Mat(N, N, CV_8UC1);
+		for (int i = 0; i < N; i++)//h
+		{
+			uchar* ptr = img_M.ptr<uchar>(i);
+			int img_index = 0;
+			for (int j = 0; j < N; j++)//w
+			{
+					ptr[img_index++] = 255*M[i*N+j];//norm M to [0-255]
+					
+			}
+		}
+		//resize M to 448*448
+		//cv::imshow("0",cv_img);
+		cv::Mat resize_img_M = cv::Mat(in_size,in_size,CV_8UC1);
+		cv::resize(img_M, resize_img_M, resize_img_M.size(), 0, 0, cv::INTER_LINEAR);
+		//cv::imshow("1",resize_img_M);
+		
+		//find the maximum connected region
+		vector< vector<cv::Point> > contours;
+		
+		//binarization
+		cv::threshold(resize_img_M, resize_img_M, cv::mean(resize_img_M)[0], 255, CV_THRESH_BINARY);
+		//cv::threshold(resize_img_M, resize_img_M, 0, 255, CV_THRESH_BINARY | CV_THRESH_OTSU);
+		//cv::imshow("2",resize_img_M);
+		
+		//find the edge of region
+		cv::findContours(resize_img_M, contours, CV_RETR_EXTERNAL, CV_CHAIN_APPROX_NONE);
+		
+		//search the maximum connected region
+		double maxArea = 0;
+		vector<cv::Point> maxContour;
+		for(size_t i=0; i<contours.size(); i++)
+		{
+		        double area = cv::contourArea(contours[i]);
+		        if(area>maxArea)
+		        {
+		                maxArea = area;
+		                maxContour = contours[i];
+		        }
+		}
+		
+		//region rectangle
+		cv::Rect maxRect = cv::boundingRect(maxContour);
+		
+		//convert rectangle to square
+		maxRect.x = maxRect.x + cvRound((maxRect.width-maxRect.height)/4.0);
+		maxRect.y = maxRect.y + cvRound((maxRect.height-maxRect.width)/4.0);
+		maxRect.height = cvRound((maxRect.width+maxRect.height)/2.0);
+		maxRect.width = maxRect.height;
+		cv::Rect original_rect(0,0,in_size,in_size);
+		maxRect = maxRect & original_rect;
+		
+		//cv::rectangle(cv_img, maxRect, cv::Scalar(0,0,255));
+		//cv::imshow("3",cv_img);
+		
+		
+
+		//output cropped image 224*224
+		cv::Mat cv_cropped_img = cv_img(maxRect);
+		cv::resize(cv_cropped_img, out_cv_img, out_cv_img.size(), 0, 0, cv::INTER_LINEAR);
+		//cv::imshow("2",out_cv_img);
+		//cvWaitKey(0);
+		int top_index;
+		for (int i = 0; i < out_size; i++)//h
+		{
+			const uchar* ptr = out_cv_img.ptr<uchar>(i);
+			int img_index = 0;
+			for (int j = 0; j < out_size; j++)//w
+			{
+
+				for (int k = 0; k < 3; k++)//c
+				{
+					Dtype pixel = static_cast<Dtype>(ptr[img_index++]);
+					top_index = n * top[0]->count(1) + (k * out_size + i) * out_size + j;
+					top_data_cpu[top_index] = pixel - mean_value[k];
+				}
+
+
+			}
+		}
+	  
+	}
+	
+
+}
+
+
+
+template<typename Dtype>
+void MultiProposalCropLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+        const vector<bool>& propagate_down,
+        const vector<Blob<Dtype>*>& bottom) {
+	
+
+
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(MultiProposalCropLayer);
+#endif
+
+INSTANTIATE_CLASS(MultiProposalCropLayer);
+REGISTER_LAYER_CLASS(MultiProposalCrop);
+
+}  // namespace caffe

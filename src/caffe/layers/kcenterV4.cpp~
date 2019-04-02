@@ -1,0 +1,130 @@
+//angular loss  不收涟  去掉前面的2（1+tan*tan）等 可以运行并且效果还可以car67.8 scale=10 nodrop
+#include <algorithm>
+#include <vector>
+#include "stdio.h"
+#include "caffe/filler.hpp"
+#include "caffe/layer.hpp"
+#include "caffe/layers/kcenterV4.hpp"
+#include "caffe/util/io.hpp"
+#include "caffe/util/math_functions.hpp"
+#include <cmath>
+#define PI 3.1415926535898
+/**********************/
+/**/
+namespace caffe {
+
+template <typename Dtype>
+void KcenterV4LossLayer<Dtype>::LayerSetUp(
+  const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  LossLayer<Dtype>::LayerSetUp(bottom, top);
+  CHECK_EQ(bottom[0]->height(), 1);
+  CHECK_EQ(bottom[0]->width(), 1);
+  distance_temp_.Reshape(1,bottom[0]->channels(),1,1);
+  diff_temp_.Reshape(1,bottom[0]->channels(), 1, 1); //存储临../..时差量
+  center_temp_.Reshape(1,bottom[0]->channels(), 1, 1); //存储临时差量
+  diff_.Reshape(bottom[0]->num(),bottom[0]->channels(), 1, 1);
+}
+template <typename Dtype>
+void KcenterV4LossLayer<Dtype>::Forward_cpu(
+    const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+    const Dtype* data = bottom[0]->cpu_data();
+    const Dtype* label = bottom[1]->cpu_data();
+    int num = bottom[0]->num();//
+    int channels = bottom[0]->channels();
+    Dtype beta = this->layer_param_.kcenterv4_loss_param().beta();
+    Dtype alpha = this->layer_param_.kcenterv4_loss_param().alpha();
+    Dtype tan = std::tan(alpha*PI/180);
+    Dtype loss = 0;
+    Dtype* diff = diff_.mutable_cpu_data();
+    Dtype* diff_temp = diff_temp_.mutable_cpu_data();
+    Dtype* center_temp = center_temp_.mutable_cpu_data();
+    caffe_set(channels*num, Dtype(0), diff);
+    top[0]->mutable_cpu_data()[0]=0;
+    for(int i=0; i<num; i=i+2)
+	{
+                                std::vector<std::pair<Dtype, int> > distance_n;//用于存储distance_n和序号
+                                caffe_cpu_axpby(channels, Dtype(1), data + i * channels, Dtype(0), center_temp);
+                                caffe_cpu_axpby(channels, Dtype(1), data + (i + 1) * channels, Dtype(1), center_temp);//xa+xp
+                                
+	
+				Dtype distance_temp1 = Dtype(2)*(Dtype(1)+tan*tan)*caffe_cpu_dot(channels, data + i * channels, data + (i + 1) * channels);//正样本 2*(1+tan*tan)xa*xp  
+				//LOG(INFO)<<caffe_cpu_dot(channels, data + i * channels, data + i * channels);
+				//找最大值
+				Dtype max1=distance_temp1;
+				for(int j=0;j<num;j++)
+				{
+				        if(label[i]!=label[j]) 
+				        {
+				            Dtype temp_max = Dtype(4*tan*tan)*caffe_cpu_dot(channels, center_temp, data + j * channels);//4*tan*tan(xa+xp)xj  
+				            distance_n.push_back(std::make_pair(temp_max, j));
+				            
+				            max1 = max1>=temp_max ? max1: temp_max;
+				        }
+				}
+				
+				distance_temp1 = exp(distance_temp1 - max1);//正样本 exp(2(1+tan*tan)xa*xp)
+				Dtype distance_temp=0;//负样本 exp(xixj)
+				for(int j=0;j<num-2;j++) 
+				{
+					    distance_n[j].first = exp(distance_n[j].first - max1);
+					    distance_temp+=distance_n[j].first;
+				}
+				
+
+				loss = -log(std::max(Dtype(distance_temp1/(distance_temp1 + distance_temp)),Dtype(1e-20))) + caffe_cpu_dot(channels,data + i * channels,data + i * channels)/Dtype(2)*beta;//beta is param of the L2 norm on xa vector, in practical beta=0
+				
+                                //compute gradients
+                                //compute L2 gradients
+				caffe_cpu_axpby(channels, beta, data + i * channels, Dtype(1), diff + i * channels);
+				
+				//xa 的梯度
+				caffe_cpu_axpby(channels, Dtype(distance_temp1*2*(1+tan*tan)), data + (i+1) * channels, Dtype(0), diff_temp);//
+				for (int j = 0; j < num-2; j++){
+				     caffe_cpu_axpby(channels, Dtype(distance_n[j].first*4*tan*tan), data + distance_n[j].second * channels, Dtype(1), diff_temp);//
+				}
+				caffe_cpu_scale(channels, Dtype(1/(distance_temp1+distance_temp)), diff_temp, diff_temp);
+				caffe_cpu_axpby(channels, Dtype(-2*(1+tan*tan)), data+(i+1)*channels, Dtype(1), diff_temp);//
+		                caffe_cpu_axpby(channels, Dtype(1), diff_temp, Dtype(1), diff+i*channels);
+				//xp 的梯度	
+				caffe_cpu_axpby(channels, Dtype(distance_temp1*2*(1+tan*tan)), data + i * channels, Dtype(0), diff_temp);//
+				for (int j = 0; j < num-2; j++){  
+				    caffe_cpu_axpby(channels, Dtype(distance_n[j].first*4*tan*tan), data + distance_n[j].second * channels, Dtype(1), diff_temp);//
+				}
+				caffe_cpu_scale(channels, Dtype(1/(distance_temp1+distance_temp)), diff_temp, diff_temp);
+				caffe_cpu_axpby(channels, Dtype(-2*(1+tan*tan)), data+i*channels, Dtype(1), diff_temp);//
+			        caffe_cpu_axpby(channels, Dtype(1), diff_temp, Dtype(1), diff+(i+1)*channels);
+	                        //更新负类样本梯度
+			        for (int j = 0; j < num-2; j++)
+				{ 
+					caffe_cpu_axpby(channels, Dtype(distance_n[j].first*4*tan*tan/(distance_temp + distance_temp1)), center_temp, Dtype(1), diff+distance_n[j].second*channels);
+
+				}//
+
+		                top[0]->mutable_cpu_data()[0] += loss;
+	}
+    top[0]->mutable_cpu_data()[0] =top[0]->mutable_cpu_data()[0]*2/num;
+}
+
+     
+
+template <typename Dtype>
+void KcenterV4LossLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+	const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) 
+{
+    //update gradients
+    caffe_cpu_axpby(bottom[0]->count(), top[0]->cpu_diff()[0]*Dtype(2)/bottom[0]->num(), diff_.cpu_data(), Dtype(0.0), bottom[0]->mutable_cpu_diff());
+	
+}
+
+
+
+
+//#ifdef CPU_ONLY
+//STUB_GPU(kcenterLossLayer);
+//#endif
+
+INSTANTIATE_CLASS(KcenterV4LossLayer);
+REGISTER_LAYER_CLASS(KcenterV4Loss);
+
+}  // namespace caffe

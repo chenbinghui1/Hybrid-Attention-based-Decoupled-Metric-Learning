@@ -1,0 +1,39 @@
+#include <vector>
+
+#include "caffe/filler.hpp"
+#include "caffe/layers/BIER_adv_loss_layer.hpp"
+#include "caffe/util/math_functions.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+void BIERAdvLossLayer<Dtype>::Forward_gpu(const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+    int num = bottom[0]->num();
+    int channels = bottom[0]->channels();
+    top[0]->mutable_cpu_data()[0]=Dtype(0.);
+    const Dtype* feai = bottom[0]->gpu_data();
+    const Dtype* feaj = bottom[1]->gpu_data();
+    Dtype* temp = temp_.mutable_gpu_data();
+    Dtype loss = 0.;
+    //fi .* fj
+    caffe_gpu_mul(num*channels, feai, feaj, temp);
+    // sum(fi .* fj)^2
+    caffe_gpu_dot(num*channels, temp, temp, &loss);
+    top[0]->mutable_cpu_data()[0] = loss/num/channels;
+}
+
+
+template <typename Dtype>
+void BIERAdvLossLayer<Dtype>::Backward_gpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down,
+    const vector<Blob<Dtype>*>& bottom) {
+        caffe_gpu_mul(bottom[0]->count(), temp_.gpu_data(), bottom[1]->gpu_data(), bottom[0]->mutable_gpu_diff());
+        caffe_gpu_scale(bottom[0]->count(), Dtype(2)*top[0]->cpu_diff()[0]/bottom[0]->count(), bottom[0]->gpu_diff(), bottom[0]->mutable_gpu_diff());
+        caffe_gpu_mul(bottom[0]->count(), temp_.gpu_data(), bottom[0]->gpu_data(), bottom[1]->mutable_gpu_diff());
+        caffe_gpu_scale(bottom[0]->count(), Dtype(2)*top[0]->cpu_diff()[0]/bottom[0]->count(), bottom[1]->gpu_diff(), bottom[1]->mutable_gpu_diff()); 
+}
+
+INSTANTIATE_LAYER_GPU_FUNCS(BIERAdvLossLayer);
+
+}  // namespace caffe

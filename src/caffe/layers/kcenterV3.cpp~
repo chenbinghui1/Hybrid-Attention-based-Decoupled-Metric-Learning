@@ -1,0 +1,261 @@
+// AAAI18 submition
+#include <algorithm>
+#include <vector>
+#include "stdio.h"
+#include "caffe/filler.hpp"
+#include "caffe/layer.hpp"
+#include "caffe/layers/kcenterV3.hpp"
+#include "caffe/util/io.hpp"
+#include "caffe/util/math_functions.hpp"
+#include <cmath>
+/**********************/
+/**/
+namespace caffe {
+
+template <typename Dtype>
+void KcenterV3LossLayer<Dtype>::LayerSetUp(
+  const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  LossLayer<Dtype>::LayerSetUp(bottom, top);
+  if (this->blobs_.size() > 0) {
+    LOG(INFO) << "Skipping parameter initialization";
+  } else {
+    this->blobs_.resize(1);
+    // Intialize the weight
+    vector<int> center_shape(2);
+    center_shape[0] = this->layer_param_.kcenterv3_loss_param().categories();
+    center_shape[1] = bottom[0]->channels();
+    this->blobs_[0].reset(new Blob<Dtype>(center_shape));
+    // fill the weights
+    shared_ptr<Filler<Dtype> > center_filler(GetFiller<Dtype>(
+        this->layer_param_.kcenterv3_loss_param().center_filler()));
+    center_filler->Fill(this->blobs_[0].get());
+
+  }
+  CHECK_EQ(bottom[0]->height(), 1);
+  CHECK_EQ(bottom[0]->width(), 1);
+  diff_temp_.Reshape(1,bottom[0]->channels(), 1, 1); //存储临时差量
+  center_temp_.Reshape(1,bottom[0]->channels(), 1, 1); //存储临时差量
+  diff_.Reshape(bottom[0]->num(),bottom[0]->channels(), 1, 1);
+  center_temp1_.Reshape(1,bottom[0]->channels(),1,1);
+  distance_.Reshape(bottom[0]->num(), bottom[0]->channels(), 1, 1);
+  variation_sum_.ReshapeLike(*this->blobs_[0]);
+  m_.Reshape(this->layer_param_.kcenterv3_loss_param().categories(),1,1,1);
+}
+////bottom[0] stores the data of positive example, bottom[1] stores the data of anchored example, bottom[2] stores the data of negative example;
+template <typename Dtype>
+void KcenterV3LossLayer<Dtype>::Forward_cpu(
+    const vector<Blob<Dtype>*>& bottom,
+    const vector<Blob<Dtype>*>& top) {
+    int num = bottom[0]->num();//
+    int channels = bottom[0]->channels();
+
+    Dtype coeff = this->layer_param_.kcenterv3_loss_param().coeff();
+    Dtype loss(0.0);
+    Dtype kk = this->layer_param_.kcenterv3_loss_param().k();//M 的系数
+    Dtype* center = this->blobs_[0]->mutable_cpu_data();
+	Dtype* diff = diff_.mutable_cpu_data();
+	
+	
+	Dtype* center_temp = center_temp_.mutable_cpu_data();
+	Dtype* center_temp1 = center_temp1_.mutable_cpu_data();
+	
+    const Dtype* data = bottom[0]->cpu_data();
+    const Dtype* label = bottom[1]->cpu_data();
+	const int kcenter_n=this->layer_param_.kcenterv3_loss_param().kcenter_n();//算邻近负样本的个数
+	float distance_temp=0;//用于存储临时distance
+	
+	int num_flag_n=0;//记录找到的不同类特征的数目
+	
+	caffe_set(channels*num, Dtype(0), diff);
+	
+	top[0]->mutable_cpu_data()[0]=0;
+	int count_cos=0,count_cos1=0;
+	Dtype M;
+	for(int i=0; i<num; i++)
+	{
+		caffe_set(channels, Dtype(0), center_temp);
+		std::vector<std::pair<float, long int> > distance_n;//用于存储distance和序号
+
+		
+			num_flag_n=0;
+			for (int j=0; j<num; j++)  //计算所有负类到i中心的距离
+			{       
+				if(label[i]!=label[j])
+				{
+					num_flag_n++;
+					distance_temp=caffe_cpu_dot(channels,data + j*channels,center + static_cast<int>(label[i])*channels);//类型转化可能会有问题，调试注
+					//printf("distance_temp=%f\n",std::sqrt(distance_temp));
+					distance_n.push_back(std::make_pair(Dtype(0) - std::sqrt(distance_temp), j));
+				
+				}
+			 
+			}
+		  
+			if(num_flag_n>=kcenter_n)
+			{
+				std::partial_sort(distance_n.begin(), distance_n.begin() + kcenter_n,distance_n.end());//负类排序
+				Dtype x_norm = std::sqrt(caffe_cpu_dot(channels,data+i*channels,data+i*channels));//xi norm
+				Dtype center_norm = std::sqrt(caffe_cpu_dot(channels,center+static_cast<int>(label[i])*channels,center+static_cast<int>(label[i])*channels));//center norm
+				Dtype negative_norm = std::sqrt(caffe_cpu_dot(channels, data+distance_n[0].second*channels,data+distance_n[0].second*channels));//nearest negative norm
+				Dtype cos = caffe_cpu_dot(channels,data+i*channels,center+static_cast<int>(label[i])*channels)/(x_norm*center_norm);
+				Dtype cos1 = caffe_cpu_dot(channels,data+distance_n[0].second*channels,center+static_cast<int>(label[i])*channels)/(negative_norm*center_norm);
+
+			    if(cos<=cos1) {//cos<=cos1
+				count_cos++;
+				Dtype distance_temp1 = caffe_cpu_dot(channels, data + i * channels, center+static_cast<int>(label[i])*channels);//正样本
+				//找最大值
+				Dtype max1=distance_temp1;
+				for(int j=0;j<kcenter_n;j++){
+				        Dtype temp_max =caffe_cpu_dot(channels, data + distance_n[j].second * channels, center +  static_cast<int>(label[i])* channels);
+				        max1 = max1>=temp_max ? max1: temp_max;
+				}
+				distance_temp1 = exp(distance_temp1 - max1);//正样本
+				distance_temp=0;//负样本
+				for(int j=0;j<kcenter_n;j++)
+				{
+					
+					distance_n[j].first = exp(caffe_cpu_dot(channels, data + distance_n[j].second * channels, center + static_cast<int>(label[i]) * channels) - max1);
+					
+					distance_temp+=distance_n[j].first;
+				}
+				//printf("%12f\n",distance_temp);
+
+
+				loss = -log(std::max(Dtype(distance_temp1/(distance_temp1 + distance_temp)),Dtype(1e-20))) + caffe_cpu_dot(channels,data + i * channels,data + i * channels)/Dtype(2)*coeff;
+				
+				if(loss>=0)
+				{       //Dtype dis_center_norm = std::sqrt(caffe_cpu_dot(channels,diff_temp,diff_temp));
+				        
+					
+					//更新当前样本梯度
+					caffe_cpu_axpby(channels, coeff, data + i * channels, Dtype(1), diff + i * channels);
+					
+					caffe_copy(channels, center+static_cast<int>(label[i])*channels, center_temp1);
+                                        caffe_cpu_axpby(channels,distance_temp1/(distance_temp + distance_temp1)-1,center_temp1,Dtype(1),diff+i*channels);
+                                        //fuyangben
+                                        for(int j=0;j<kcenter_n;j++){
+                                            caffe_cpu_axpby(channels,distance_n[j].first/(distance_temp1+distance_temp),center+static_cast<int>(label[i])*channels,Dtype(1),diff+distance_n[j].second*channels);
+                                        }
+                                        
+					//1/m 有backward加
+				}
+				}
+			    else {
+				count_cos1++;
+				M = std::sqrt(2-2*std::cos(std::acos(cos1)-std::acos(cos)))*kk;
+				
+				caffe_cpu_axpby(channels, Dtype(1), data+i*channels, Dtype(0), center_temp);
+				caffe_cpu_axpby(channels, Dtype(-1), center+static_cast<int>(label[i])*channels, Dtype(1), center_temp);//xi-cyi
+				Dtype new_norm = std::sqrt(caffe_cpu_dot(channels, center_temp, center_temp));//||xi-cyi||
+				caffe_copy(channels, data+i*channels, center_temp1);
+				caffe_cpu_axpby(channels, Dtype(M*x_norm/new_norm), center_temp, Dtype(1), center_temp1);//分母向量
+				Dtype new_norm1 = std::sqrt(caffe_cpu_dot(channels, center_temp1, center_temp1));//分母
+				Dtype ans1 = caffe_cpu_dot(channels, data+i*channels, center+static_cast<int>(label[i])*channels);//xi*c
+				Dtype ans = ans1-caffe_cpu_dot(channels,center+static_cast<int>(label[i])*channels,center+static_cast<int>(label[i])*channels);//xi*c-c*c
+				
+				//正样本
+				Dtype distance_temp1 = (ans*x_norm*x_norm*M/new_norm+ans1*x_norm)/new_norm1;//xg*c  
+				//找最大值
+				Dtype max1=distance_temp1;
+				for(int j=0;j<kcenter_n;j++){
+				        Dtype temp_max =caffe_cpu_dot(channels, data + distance_n[j].second * channels, center +  static_cast<int>(label[i])* channels);
+				        max1 = max1>=temp_max ? max1: temp_max;
+				}
+				distance_temp1 = exp(distance_temp1 - max1);//正样本
+				distance_temp=0;//负样本
+				for(int j=0;j<kcenter_n;j++)
+				{
+					
+					distance_n[j].first = exp(caffe_cpu_dot(channels, data + distance_n[j].second * channels, center + static_cast<int>(label[i]) * channels) - max1);
+					
+					distance_temp+=distance_n[j].first;
+				}
+				//printf("%12f\n",distance_temp);
+
+
+				loss = -log(std::max(Dtype(distance_temp1/(distance_temp1 + distance_temp)),Dtype(1e-20))) + caffe_cpu_dot(channels,data + i * channels,data + i * channels)/Dtype(2)*coeff;
+				
+				if(loss>=0)
+				{       
+
+					//更新当前样本梯度
+					caffe_cpu_axpby(channels, coeff, data + i * channels, Dtype(1), diff + i * channels);
+					Dtype ans2 = caffe_cpu_dot(channels, center_temp, data+i*channels);
+					
+					caffe_cpu_scale(channels, x_norm*x_norm*M*ans/(new_norm*new_norm*new_norm), center_temp, center_temp);
+					caffe_cpu_axpby(channels, Dtype(x_norm*x_norm*M/new_norm+x_norm), center+static_cast<int>(label[i])*channels, Dtype(-1), center_temp);
+					caffe_cpu_axpby(channels, ans*M/new_norm, data+i*channels, Dtype(1), center_temp);
+					caffe_cpu_axpby(channels, (x_norm+M*ans2/new_norm)*(ans*x_norm*M/new_norm+ans1)/(new_norm1*new_norm1*new_norm1)*Dtype(-1), center_temp1, Dtype(1/new_norm1), center_temp);
+					caffe_cpu_axpby(channels, (ans*x_norm*M+new_norm*ans1)/(new_norm*x_norm*new_norm1), data+i*channels, Dtype(1), center_temp);
+                                        caffe_cpu_axpby(channels, (distance_temp1/(distance_temp + distance_temp1)-Dtype(1)), center_temp, Dtype(1), diff+i*channels);
+                                        
+                                        //caffe_cpu_axpby(channels,Dtype(-1),center+static_cast<int>(label[i])*channels,Dtype(1),center_temp);
+                                        //Dtype anss=caffe_cpu_dot(channels,center_temp,center_temp);
+                                        //LOG(INFO)<<"anss   "<<anss;
+                                        //负样本
+                                        for(int j=0;j<kcenter_n;j++){
+                                            caffe_cpu_axpby(channels,distance_n[j].first/(distance_temp1+distance_temp),center+static_cast<int>(label[i])*channels,Dtype(1),diff+distance_n[j].second*channels);
+                                        }
+                                        
+					//1/m 有backward加
+				}
+				}
+			}
+			else
+			{
+				loss=0;
+			}
+		
+		top[0]->mutable_cpu_data()[0] += loss;
+	}
+	top[0]->mutable_cpu_data()[0] /=num;
+	
+  for (int i=0; i<num; i++) {
+       caffe_sub<Dtype>(channels, data + i * channels, center + static_cast<int>(label[i]) * channels, distance_.mutable_cpu_data() + i * channels );
+  }
+  
+ // LOG(INFO)<<"count_cos="<<count_cos<<"    count_cos1="<<count_cos1<<"     M="<<M;
+}
+
+     
+
+template <typename Dtype>
+void KcenterV3LossLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+	const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) 
+{
+    caffe_cpu_axpby(bottom[0]->count(), top[0]->cpu_diff()[0]/bottom[0]->num(), diff_.cpu_data(), Dtype(0.0), bottom[0]->mutable_cpu_diff());
+    
+    //update center
+    int num = bottom[0]->num();//
+    int channels = bottom[0]->channels();
+    const Dtype* label = bottom[1]->cpu_data();
+    Dtype* center_diff = this->blobs_[0]->mutable_cpu_diff();
+    Dtype* variation_sum_data = variation_sum_.mutable_cpu_data();
+    const Dtype* distance_data = distance_.cpu_data();
+    Dtype* m = m_.mutable_cpu_data();
+    caffe_set(m_.count(),Dtype(0),m);
+
+    // \sum_{y_i==j}
+    caffe_set(variation_sum_.count(), (Dtype)0., variation_sum_.mutable_cpu_data());
+    for (int i=0; i < num; i++) {
+      caffe_sub(channels, variation_sum_data + static_cast<int>(label[i])*channels, distance_data + i*channels, variation_sum_data + static_cast<int>(label[i])*channels);
+      m[static_cast<int>(label[i])] += 1;
+    }
+   for (int i = 0; i < this->layer_param_.kcenterv3_loss_param().categories(); i++) {
+      if (m[i]>0)
+      caffe_cpu_axpby(channels, Dtype(1)/(m[i] + (Dtype)1.), variation_sum_data + static_cast<int>(label[i])*channels, Dtype(0), center_diff + static_cast<int>(label[i]) * channels);
+    }
+		
+}
+
+
+
+
+//#ifdef CPU_ONLY
+//STUB_GPU(kcenterLossLayer);
+//#endif
+
+INSTANTIATE_CLASS(KcenterV3LossLayer);
+REGISTER_LAYER_CLASS(KcenterV3Loss);
+
+}  // namespace caffe
