@@ -14,9 +14,9 @@ This code is developed based on [Caffe](https://github.com/BVLC/caffe/).
 
 ### Updates
 - Apr 02, 2019
-  * The code and training prototxt for our [CVPR19](www.bhchen.cn) paper are released.
-  * For simplication, we use Hinge_Loss-like adversarial constraint instead of the original adversary network (This will reduce the final performance a little. We also provide the "gradients_reverse_layer" for the implementation of the orginal adversary network.).
-  * If you train our Network on **CUB-200**, the expected retrieval performance will be ~**(R@1=64.7, R@2=75.1, R@4=83.2, R@8=89.4)** at ~10k iterations.
+  * The code and training prototxt for our [CVPR19](http://bhchen.cn) paper are released.
+  * For simplication, we use Hinge_Loss-like adversarial constraint instead of the original adversary network (This will reduce the final performance a little but ease the training. We also provide the "gradients_reverse_layer" for the implementation of the orginal adversary network.).
+  * If you train our Network on **CUB-200**, the expected retrieval performance of DeML(I=3,J=3) will be ~**(R@1=64.7, R@2=75.1, R@4=83.2, R@8=89.4)** at ~10k iterations.
 
 ### Files
 - Original Caffe library
@@ -34,12 +34,19 @@ This code is developed based on [Caffe](https://github.com/BVLC/caffe/).
   * src/caffe/layers/proposal_crop_layer.cpp (For single convolution input)
   * include/caffe/layers/proposal_crop_layer.hpp (For multi convolution input)
   * src/caffe/layers/proposal_crop_layer.cpp (For multi convolution input)
+- gradients_reverse
+  * src/caffe/proto/caffe.proto
+  * include/caffe/layers/gradients_reverse_layer.hpp
+  * src/caffe/layers/gradients_reverse_layer.cpp
+  * src/caffe/layers/gradients_reverse_layer.cu
 - CUB
-  * examples/CUB/*
+  * examples/CUB/U512  (This is for the implementation of baseline method U512)
+  * examples/CUB/DeML3-3_512  (This is for the implementation of our method DeML(I=3,J=3))
+  * examples/CUB/pre-trained-model
 ### Prerequisites
 * Caffe
 * Matlab (for evaluation)
-* 2GPUs
+* 2GPUs, each > 11G
 ### Train_Model
 1. The Installation is completely the same as [Caffe](http://caffe.berkeleyvision.org/). Please follow the [installation instructions](http://caffe.berkeleyvision.org/installation.html). Make sure you have correctly installed before using our code. 
 2. Download the training images. [CUB]() and move it to your_path. The images are preprossed the same as [Lifted Loss](https://github.com/rksltnl/Deep-Metric-Learning-CVPR16/), i.e. with zero paddings.
@@ -67,7 +74,7 @@ and
 3. Run extractDeepFeature.m in Matlab
 
 ### Contact 
-- [Binghui Chen](www.bhchen.cn)
+- [Binghui Chen](http://bhchen.cn)
 
 ### Citation
 You are encouraged to cite the following papers if this work helps your research. 
