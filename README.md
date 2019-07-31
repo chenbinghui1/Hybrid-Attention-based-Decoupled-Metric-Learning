@@ -84,7 +84,7 @@ the feature files are stored at folder "features/"
 ### Citation
 You are encouraged to cite the following papers if this work helps your research. 
 
-    @inproceedings{chen2017hybrid,
+    @inproceedings{chen2019hybrid,
       title={Hybrid-Attention based Decoupled metric Learning for Zero-Shot Image Retrieval},
       author={Chen, Binghui and Deng, Weihong},
       booktitle={Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
